@@ -6,7 +6,9 @@ from pathlib import Path
 
 from markitdown import MarkItDown
 
-from embeddings import embed, settings
+import mimetypes
+
+from embeddings import embed, embed_file, settings
 from jobstore import claim_next_job, connect as connect_jobs, recover_stale_jobs
 from object_store import ensure_container, get as get_object
 from storage import INDEX, client, initialize_index
@@ -21,13 +23,25 @@ def connect():
 
 def process(job):
     try:
+        config = settings()
+        content_type = mimetypes.guess_type(job["filename"].lower())[0] or "application/octet-stream"
+        data = get_object(job["object_key"]).readall()
         with tempfile.NamedTemporaryFile(suffix=".pdf") as pdf:
-            pdf.write(get_object(job["object_key"]).readall())
-            pdf.flush()
-            markdown = MarkItDown(enable_plugins=False).convert_local(pdf.name).markdown.strip()
-        if not markdown:
-            raise ValueError("MarkItDown no encontró texto; los PDFs escaneados fallan porque OCR está desactivado")
-        vector = embed(markdown)
+            if content_type == "application/pdf":
+                pdf.write(data)
+                pdf.flush()
+                try:
+                    markdown = MarkItDown(enable_plugins=False).convert_local(pdf.name).markdown.strip()
+                except Exception:
+                    if config["document_mode"] != "direct":
+                        raise
+                    markdown = ""
+            else:
+                markdown = ""
+        if not markdown and config["document_mode"] != "direct":
+            raise ValueError("MarkItDown no encontró texto; OCR está desactivado. Activa Jina multimodal directo para PDFs escaneados")
+        vector = (embed_file(data, content_type, job["id"]) if config["document_mode"] == "direct"
+                  else embed(markdown))
         es = client()
         es.index(index=INDEX, id=job["id"], document={
             "invoice_id": job["id"], "sha256": job["sha256"],

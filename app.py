@@ -2,8 +2,10 @@ import hashlib
 import base64
 import binascii
 import hmac
+import mimetypes
 import os
 import uuid
+from io import BytesIO
 from contextlib import asynccontextmanager, closing
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +16,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from PIL import Image
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -109,6 +112,8 @@ class SearchRequest(BaseModel):
 
 
 class EmbeddingSettings(BaseModel):
+    provider: Literal["openai-compatible", "jina-local"] = "openai-compatible"
+    document_mode: Literal["text", "direct"] = "text"
     base_url: str = Field(min_length=1, max_length=500)
     model: str = Field(min_length=1, max_length=200)
     api_key: str = Field(default="", max_length=2000)
@@ -217,20 +222,27 @@ def health():
             "embedding_service": inference_ok,
             "configured_model": embedding_settings()["model"],
             "model_available": model_available,
-            "document_processing": "MarkItDown text extraction; OCR disabled; scanned PDFs may produce no text",
-            "pdf_representation": "text-derived embeddings, not multimodal PDF embeddings"}
+            "document_processing": ("Jina direct PDF/image embeddings" if embedding_settings()["document_mode"] == "direct"
+                                    else "MarkItDown text extraction; OCR disabled; scanned PDFs may produce no text"),
+            "pdf_representation": ("multimodal PDF/image embeddings" if embedding_settings()["document_mode"] == "direct"
+                                   else "text-derived embeddings, not multimodal PDF embeddings")}
 
 
 @app.get("/api/settings/embeddings", dependencies=[Depends(require_token)])
 def get_embedding_settings():
     config = embedding_settings()
-    return {"base_url": config["base_url"], "model": config["model"], "api_key_configured": bool(config["api_key"])}
+    return {"provider": config["provider"], "base_url": config["base_url"],
+            "model": config["model"], "document_mode": config["document_mode"],
+            "dimensions": config["dimensions"], "api_key_configured": bool(config["api_key"])}
 
 
 @app.put("/api/settings/embeddings", dependencies=[Depends(require_token)])
 def put_embedding_settings(config: EmbeddingSettings):
     current = embedding_settings()
-    update_settings(config.base_url, config.model, config.api_key or current["api_key"])
+    if config.document_mode == "direct" and config.provider != "jina-local":
+        raise HTTPException(422, "El modo directo PDF/imagen requiere Jina local")
+    update_settings(config.base_url, config.model, config.api_key or current["api_key"],
+                    config.provider, config.document_mode)
     return get_embedding_settings()
 
 
@@ -246,10 +258,9 @@ def get_embedding_models():
     "/api/documents",
     dependencies=[Depends(require_token)],
     tags=["Facturas"],
-    summary="Subir un bloque de facturas PDF",
-    description=("Envía uno o más archivos en el campo multipart repetido `files`. "
-                 "Cada archivo recibe su propio estado; un PDF inválido no cancela los demás. "
-                 "Límites configurables: `MAX_BATCH_FILES` por bloque y `MAX_UPLOAD_MB` por PDF."),
+    summary="Subir PDFs e imágenes",
+    description=("Envía archivos en el campo multipart repetido `files`. Imágenes y PDFs directos requieren "
+                 "Jina local en modo directo; el modo texto acepta PDFs con texto extraíble."),
     response_model=UploadResponse,
     responses={
         401: {"model": ApiError, "description": "Bearer token ausente o no válido."},
@@ -257,20 +268,37 @@ def get_embedding_models():
         503: {"model": ApiError, "description": "El token no está configurado."},
     },
 )
-async def upload(files: list[UploadFile] = File(..., description="Uno o más PDFs; repite el campo `files` para cada archivo.")):
+async def upload(files: list[UploadFile] = File(..., description="Uno o más PDFs o imágenes; repite `files` por archivo.")):
     if len(files) > MAX_BATCH_FILES:
         raise HTTPException(413, f"El bloque supera el límite de {MAX_BATCH_FILES} ficheros")
+    embedding_config = embedding_settings()
     created = []
     with closing(connect()) as db:
         for file in files:
             try:
-                if not file.filename or not file.filename.lower().endswith(".pdf"):
-                    raise ValueError("Solo se admiten ficheros PDF")
+                suffix = Path(file.filename or "").suffix.lower()
+                content_type = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg",
+                                ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(suffix)
+                if not content_type:
+                    raise ValueError("Solo se admiten PDF, PNG, JPEG y WEBP")
+                if embedding_config["document_mode"] == "direct" and embedding_config["provider"] != "jina-local":
+                    raise ValueError("El modo directo PDF/imagen requiere Jina local")
                 data = await file.read(MAX_BYTES + 1)
                 if len(data) > MAX_BYTES:
-                    created.append({"filename": file.filename, "status": "rejected", "error": "El PDF supera el límite configurado"})
+                    created.append({"filename": file.filename, "status": "rejected", "error": "El archivo supera el límite configurado"})
                     continue
-                data = normalize_pdf(data)
+                if content_type == "application/pdf":
+                    data = normalize_pdf(data)
+                else:
+                    if embedding_config["provider"] != "jina-local" or embedding_config["document_mode"] != "direct":
+                        raise ValueError("Las imágenes requieren Jina local en modo directo")
+                    try:
+                        with Image.open(BytesIO(data)) as image:
+                            if image.format not in {"PNG", "JPEG", "WEBP"}:
+                                raise ValueError("Formato de imagen no admitido")
+                            image.verify()
+                    except (OSError, ValueError, Image.DecompressionBombError) as error:
+                        raise ValueError("La imagen no es un PNG, JPEG o WEBP válido") from error
             except ValueError as error:
                 created.append({"filename": file.filename, "status": "rejected", "error": str(error)})
                 continue
@@ -280,10 +308,10 @@ async def upload(files: list[UploadFile] = File(..., description="Uno o más PDF
                 created.append({"id": row["id"], "filename": file.filename, "status": "duplicate"})
                 continue
             doc_id = str(uuid.uuid4())
-            object_key = f"documents/{doc_id}.pdf"
+            object_key = f"documents/{doc_id}{suffix}"
             stored = False
             try:
-                await run_in_threadpool(put_object, object_key, data)
+                await run_in_threadpool(put_object, object_key, data, content_type)
                 stored = True
                 db.execute("INSERT INTO jobs(id,sha256,filename,object_key,status) VALUES(?,?,?,?,?)", (doc_id, digest, file.filename, object_key, "queued"))
                 db.commit()
@@ -368,9 +396,9 @@ def retry(doc_id: str):
     "/api/documents/{doc_id}/file",
     dependencies=[Depends(require_token)],
     tags=["Facturas"],
-    summary="Descargar el PDF original",
+    summary="Descargar el archivo original",
     responses={
-        200: {"description": "PDF original.", "content": {"application/pdf": {"schema": {"type": "string", "format": "binary"}}}},
+        200: {"description": "PDF o imagen original.", "content": {"application/pdf": {"schema": {"type": "string", "format": "binary"}}, "image/*": {"schema": {"type": "string", "format": "binary"}}}},
         401: {"model": ApiError, "description": "Bearer token ausente o no válido."},
         404: {"model": ApiError, "description": "No se encontró el documento o su original."},
         503: {"model": ApiError, "description": "El token no está configurado."},
@@ -389,7 +417,7 @@ def document_file(doc_id: str):
     def chunks():
         yield from body.chunks()
 
-    return StreamingResponse(chunks(), media_type="application/pdf",
+    return StreamingResponse(chunks(), media_type=mimetypes.guess_type(row["filename"])[0] or "application/octet-stream",
                              headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(row['filename'])}"})
 
 
@@ -491,14 +519,15 @@ HTML = '''<!doctype html><html lang="es"><meta name="viewport" content="width=de
 :root{font:16px/1.5 Inter,ui-sans-serif,system-ui;color:#e8edf5;background:#0b0f14;--panel:#121922;--line:#253140;--muted:#8e9bad;--accent:#a3e635}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 50% -25%,#1d2b2d 0,transparent 48%),#0b0f14}header,.wrap{max-width:1040px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line)}h1{font-size:1.1rem;margin:0;letter-spacing:.02em}h2{font-size:1.15rem}.brand{display:flex;align-items:center;gap:12px}.mark{display:grid;place-items:center;width:34px;height:34px;background:var(--accent);color:#101510;border-radius:10px;font-weight:900}.actions,.tabs{display:flex;gap:8px;align-items:center}button,input{font:inherit;color:inherit}button{border:1px solid var(--line);background:#1a2430;border-radius:9px;padding:10px 15px;cursor:pointer}button:hover{border-color:#71809a}button:disabled{opacity:.45;cursor:not-allowed}.primary{background:var(--accent);color:#101510;border-color:var(--accent);font-weight:700}.wrap{padding-top:48px}.hero{max-width:770px;margin:8vh auto 3rem;text-align:center}.eyebrow{color:var(--accent);font-size:.78rem;text-transform:uppercase;letter-spacing:.15em}.hero h2{font-size:clamp(2rem,5vw,3.5rem);line-height:1.08;margin:14px 0}.sub{color:var(--muted)}.searchbox{display:flex;gap:8px;margin:28px 0 12px;padding:8px;background:var(--panel);border:1px solid var(--line);border-radius:14px}.searchbox input{flex:1;min-width:0;background:transparent;border:0;outline:0;padding:10px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;margin:18px 0}.tabs{border-bottom:1px solid var(--line);padding-bottom:12px}.tab.active{color:var(--accent);border-color:#51672d}.hidden{display:none!important}input[type=text],input[type=password],input[type=url],input[type=number]{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:#0c1219}.field{display:grid;gap:7px;margin:14px 0}.muted,.hint{color:var(--muted);font-size:.9rem}ul{padding-left:22px}li{padding:8px 0;border-bottom:1px solid var(--line)}a{color:var(--accent)}pre{white-space:pre-wrap;color:#c4d0df;font-size:.85rem}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.notice{padding:14px;border:1px solid #37482b;border-radius:10px;color:#c6dd9e}@media(max-width:600px){header,.wrap{padding:18px}.wrap{padding-top:28px}.hero{margin-top:6vh}.grid{grid-template-columns:1fr}.searchbox{align-items:stretch}.searchbox button{padding:9px}}
 </style><header><div class="brand"><span class="mark">F</span><h1>Facturas</h1></div><div class="actions"><span id="auth-indicator" class="muted">Sin autenticar</span><button id="settings-shortcut">⚙ Ajustes</button></div></header><main class="wrap"><div id="auth-gate" class="panel hidden"><h2>Conecta con tu API</h2><p class="muted">Introduce el token para habilitar búsqueda, documentos y configuración.</p><div class="actions"><input id="token" type="password" autocomplete="current-password" placeholder="Token API"><button class="primary" id="save-token">Conectar</button></div><p id="auth-status" role="status"></p></div><div class="tabs"><button class="tab active" data-view="search-view">⌕ Buscar</button><button class="tab" data-view="documents-view">Documentos</button></div><section id="search-view"><div class="hero"><p class="eyebrow">Búsqueda semántica</p><h2>Encuentra la factura<br>que necesitas.</h2><p class="sub">Describe un servicio, producto o concepto para buscarlo entre tus documentos.</p><form id="search" class="searchbox"><input id="query" required placeholder="Ej. mantenimiento de impresoras"><button class="primary">Buscar</button></form><p class="hint">Resultados por similitud semántica y coincidencia de texto</p></div><section class="panel hidden" id="results-panel"><h2>Resultados</h2><ul id="results"></ul><p class="hint">MarkItDown extrae texto. OCR está desactivado; los vectores no representan la apariencia visual del PDF.</p></section></section><section id="documents-view" class="hidden"><div class="panel"><h2>Subir documentos</h2><p class="muted">Añade uno o varios archivos PDF al índice.</p><div class="field"><label for="files">Archivos PDF</label><input id="files" type="file" accept="application/pdf,.pdf" multiple></div><button class="primary" id="upload">Subir archivos</button><p id="upload-status" role="status" aria-live="polite"></p></div><div class="panel"><div class="actions" style="justify-content:space-between"><h2>Biblioteca</h2><span id="page" class="muted"></span></div><ul id="docs"></ul><button id="previous">Anterior</button> <button id="next">Siguiente</button></div></section><section id="settings-view" class="hidden"><div class="panel"><h2>Configuración</h2><p class="muted">Las opciones quedan disponibles al autenticarte con el token API.</p><h3>Embeddings</h3><form id="embedding-form"><div class="grid"><label class="field">URL del servicio<input id="embedding-url" type="url" required></label><div class="field"><label for="embedding-model">Modelo</label><div class="actions"><input id="embedding-model" type="text" required list="embedding-models"><datalist id="embedding-models"></datalist><button type="button" id="detect-models">Detectar</button></div></div></div><label class="field">Clave del proveedor<input id="embedding-key" type="password" placeholder="Dejar vacío para conservar la configurada"></label><button class="primary">Guardar configuración</button><span id="settings-status" role="status" class="muted"></span></form></div><div class="panel"><h3>Conexión MCP</h3><p class="muted">Transporte: Streamable HTTP · Endpoint: <code>/mcp</code> · Autenticación: Bearer token API</p><p class="muted">Herramientas: <code>index_invoice</code>, <code>get_invoice_status</code>, <code>semantic_search</code></p><h3>Estado del servicio</h3><pre id="health">Consultando…</pre></div></section></main><script>
 const el=(tag,text)=>{const n=document.createElement(tag);n.textContent=text;return n};let offset=0,total=0;const pageSize=50;const token=document.querySelector('#token');token.value=sessionStorage.getItem('api-token')||'';const hasToken=()=>Boolean(sessionStorage.getItem('api-token'));const gate=document.querySelector('#auth-gate');
+const styledSelect=select=>{select.style.cssText='width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:#0c1219;color:inherit'};const providerField=el('div','');providerField.className='field';const providerLabel=el('label','Proveedor de embeddings');providerLabel.htmlFor='embedding-provider';const providerSelect=document.createElement('select');providerSelect.id='embedding-provider';styledSelect(providerSelect);for(const [value,label] of [['openai-compatible','OpenAI-compatible'],['jina-local','Jina local']]){const option=el('option',label);option.value=value;providerSelect.append(option)}providerField.append(providerLabel,providerSelect,el('small','Cambiar proveedor/modelo o dimensiones requiere un índice y reindexado nuevos.'));const modeField=el('div','');modeField.className='field';const modeLabel=el('label','Modo de documentos');modeLabel.htmlFor='embedding-document-mode';const modeSelect=document.createElement('select');modeSelect.id='embedding-document-mode';styledSelect(modeSelect);for(const [value,label] of [['text','Extraer texto del PDF'],['direct','Jina multimodal directo (PDF/imagen)']]){const option=el('option',label);option.value=value;modeSelect.append(option)}const fileInput=document.querySelector('#files');const fileLabel=fileInput.parentElement.querySelector('label');const uploadHelp=document.querySelector('#documents-view .panel p');const resultsHint=document.querySelector('#results-panel .hint');const syncMode=()=>{modeSelect.options[1].disabled=providerSelect.value!=='jina-local';if(modeSelect.value==='direct'&&modeSelect.options[1].disabled)modeSelect.value='text';const direct=modeSelect.value==='direct';fileInput.accept=direct?'application/pdf,.pdf,image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp':'application/pdf,.pdf';fileLabel.textContent=direct?'PDF o imagen':'Archivo PDF';uploadHelp.textContent=direct?'Añade PDFs o imágenes PNG/JPEG/WEBP.':'Añade PDFs con texto extraíble.';resultsHint.textContent=direct?'Jina genera embeddings visuales; el texto extraído también se usa para coincidencias léxicas.':'MarkItDown extrae texto. OCR está desactivado; los vectores no representan la apariencia visual del PDF.'};modeField.append(modeLabel,modeSelect,el('small','Las imágenes solo se admiten en modo directo.'));providerSelect.onchange=syncMode;modeSelect.onchange=syncMode;document.querySelector('#embedding-form').prepend(modeField,providerField);syncMode();
 async function api(url,options={}){options.headers={...options.headers,Authorization:`Bearer ${sessionStorage.getItem('api-token')||''}`};return fetch(url,options)}
 function authUI(ok){gate.classList.toggle('hidden',ok);document.querySelector('#auth-indicator').textContent=ok?'Conectado':'Sin autenticar';document.querySelectorAll('.tab').forEach(b=>b.disabled=!ok);document.querySelector('#settings-shortcut').disabled=!ok;document.querySelector('#query').disabled=!ok;document.querySelector('#search button').disabled=!ok;document.querySelector('#upload').disabled=!ok}
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));['search-view','documents-view','settings-view'].forEach(id=>document.querySelector(`#${id}`).classList.toggle('hidden',id!==b.dataset.view))});
 document.querySelector('#settings-shortcut').onclick=()=>{document.querySelector('[data-view="search-view"]').classList.remove('active');document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));['search-view','documents-view'].forEach(id=>document.querySelector(`#${id}`).classList.add('hidden'));document.querySelector('#settings-view').classList.remove('hidden');loadSettings()};
 document.querySelector('#save-token').onclick=async()=>{const value=token.value.trim();if(!value)return;sessionStorage.setItem('api-token',value);try{const response=await api('/api/settings/embeddings');if(!response.ok)throw new Error('Token no válido');authUI(true);document.querySelector('#auth-status').textContent='';loadSettings();refresh()}catch{sessionStorage.removeItem('api-token');authUI(false);document.querySelector('#auth-status').textContent='No se pudo validar el token.'}};
-async function loadSettings(){if(!hasToken())return;const [s,h]=await Promise.all([api('/api/settings/embeddings'),fetch('/api/health')]);if(s.ok){const d=await s.json();document.querySelector('#embedding-url').value=d.base_url;document.querySelector('#embedding-model').value=d.model}document.querySelector('#health').textContent=JSON.stringify(await h.json(),null,2)}
+async function loadSettings(){if(!hasToken())return;const [s,h]=await Promise.all([api('/api/settings/embeddings'),fetch('/api/health')]);if(s.ok){const d=await s.json();document.querySelector('#embedding-provider').value=d.provider;syncMode();document.querySelector('#embedding-document-mode').value=d.document_mode;document.querySelector('#embedding-url').value=d.base_url;document.querySelector('#embedding-model').value=d.model}document.querySelector('#health').textContent=JSON.stringify(await h.json(),null,2)}
 document.querySelector('#detect-models').onclick=async()=>{const status=document.querySelector('#settings-status');status.textContent='Detectando modelos…';try{const r=await api('/api/settings/embeddings/models');const d=await r.json();if(!r.ok)throw Error(d.detail);const list=document.querySelector('#embedding-models');list.replaceChildren(...d.models.map(id=>{const option=document.createElement('option');option.value=id;return option}));status.textContent=`${d.models.length} modelos detectados. Selecciónalos o escribe un ID manualmente.`}catch(error){status.textContent=error.message}};
-document.querySelector('#embedding-form').onsubmit=async e=>{e.preventDefault();const status=document.querySelector('#settings-status');const r=await api('/api/settings/embeddings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({base_url:document.querySelector('#embedding-url').value,model:document.querySelector('#embedding-model').value,api_key:document.querySelector('#embedding-key').value})});status.textContent=r.ok?'Configuración guardada.':'No se pudo guardar la configuración.';document.querySelector('#embedding-key').value='';loadSettings()};
+document.querySelector('#embedding-form').onsubmit=async e=>{e.preventDefault();const status=document.querySelector('#settings-status');const r=await api('/api/settings/embeddings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:document.querySelector('#embedding-provider').value,document_mode:document.querySelector('#embedding-document-mode').value,base_url:document.querySelector('#embedding-url').value,model:document.querySelector('#embedding-model').value,api_key:document.querySelector('#embedding-key').value})});status.textContent=r.ok?'Configuración guardada.':'No se pudo guardar la configuración.';document.querySelector('#embedding-key').value='';loadSettings()};
 async function download(url,name){const r=await api(url);if(!r.ok)return;const link=document.createElement('a');link.href=URL.createObjectURL(await r.blob());link.download=name;link.click();URL.revokeObjectURL(link.href)}
 async function refresh(){if(!hasToken())return;const response=await api(`/api/documents?limit=${pageSize}&offset=${offset}`);if(!response.ok)return;const d=await response.json();total=d.total;const list=document.querySelector('#docs');list.replaceChildren();for(const x of d.documents){const li=el('li','');const a=el('a',x.filename);a.href=`/api/documents/${x.id}/file`;a.onclick=e=>{e.preventDefault();download(a.href,x.filename)};li.append(a,document.createTextNode(` · ${x.status}${x.error?` · ${x.error}`:''} `));if(x.status==='failed'){const b=el('button','Reintentar');b.onclick=()=>api(`/api/documents/${x.id}/retry`,{method:'POST'}).then(refresh);li.append(b)}list.append(li)}document.querySelector('#page').textContent=`${total} documentos · ${total?offset+1:0}-${Math.min(offset+pageSize,total)}`;document.querySelector('#previous').disabled=offset===0;document.querySelector('#next').disabled=offset+pageSize>=total}
 document.querySelector('#previous').onclick=()=>{offset=Math.max(0,offset-pageSize);refresh()};document.querySelector('#next').onclick=()=>{offset+=pageSize;refresh()};document.querySelector('#upload').onclick=async()=>{const files=document.querySelector('#files').files;const status=document.querySelector('#upload-status');if(!files.length){status.textContent='Selecciona al menos un PDF.';return}const body=new FormData();for(const f of files)body.append('files',f);status.textContent=`Enviando ${files.length} archivo(s)…`;try{const r=await api('/api/documents',{method:'POST',body});const d=await r.json();if(!r.ok)throw Error(d.detail||'Error al subir');status.textContent=`${d.accepted} en cola, ${d.duplicates} duplicados, ${d.rejected} rechazados.`;refresh()}catch(e){status.textContent=`No se pudo subir: ${e.message}`}};

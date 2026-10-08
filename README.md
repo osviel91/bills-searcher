@@ -2,25 +2,25 @@
 
 ## Alcance actual
 
-Esta iteración avanza con el modelo que ya responde en oMLX: `embedding` (Qwen3-Embedding, 1024 dimensiones). El flujo es **PDF con capa de texto → MarkItDown → embedding de texto → Elasticsearch**. No es búsqueda multimodal del PDF: se deja de representar la apariencia visual del documento. MarkItDown usa extracción textual/tabular PDF (pdfplumber/pdfminer); OCR está desactivado y un PDF escaneado sin capa de texto terminará en `failed`.
+Hay dos modos: **texto** extrae texto del PDF con MarkItDown; **directo** envía el PDF o la imagen a Jina multimodal. En directo se conservan embeddings visuales incluso en PDFs escaneados; el texto extraíble sigue alimentando BM25. El worker almacena originales en Azure Blob Storage (Azurite en desarrollo).
 
 El worker procesa el PDF localmente y envía el Markdown resultante al endpoint configurado de embeddings. Si el endpoint apunta a otro equipo, ese contenido sale del Mac; úsese contenido sintético/anonimizado hasta verificar la ubicación, autorización y controles del servidor. El texto extraído se conserva en Elasticsearch local para búsqueda léxica; no se escribe en logs.
 
-## Comprobación de oMLX
+## Prueba del proveedor local
 
-La instancia remota anuncia el alias `embedding`. Una llamada real de consulta con texto sintético devolvió un vector numérico de **1024 dimensiones**. El alias Jina Omni también aparece en `/v1/models`, pero oMLX responde HTTP 409 al cargarlo (`Model type jina_omni_small_mlx not supported`). No se usó Jina en esta ruta.
+La instancia local actual anuncia `jinaai/jina-embeddings-v5-omni-nano`. Verifiqué consultas de texto, un PDF y una imagen sintéticos; devuelve vectores de **768 dimensiones** y acepta `input_type=query|document`. La inferencia multimodal del PDF de prueba tardó ~175 s en CPU; el timeout predeterminado es 300 s.
 
-El prompt de consulta sigue el formato recomendado por Qwen3 Embedding (`Instruct: ...\nQuery:`); el documento se envía sin prefijo de consulta. El cliente desactiva truncamiento y fija 32768 tokens, el máximo publicado del modelo, para fallar antes que indexar silenciosamente texto recortado.
+Jina local envía PDFs como base64 junto con un `document_id`, e imágenes PNG/JPEG/WEBP como base64. El modo directo está disponible solo para el proveedor Jina local. El proveedor OpenAI-compatible conserva el flujo de texto.
 
 ## Ejecución
 
-1. Copiar `.env.example` a `.env` y `.env.runtime.example` a `.env.runtime`. Reemplazar los secretos de API y PostgreSQL por valores aleatorios; la contraseña incluida en `DATABASE_URL` debe coincidir con `POSTGRES_PASSWORD`. Configurar el endpoint de embeddings y `EMBEDDING_API_KEY`. No versionar ninguno de los dos archivos.
-2. Para oMLX en el Mac, usar `EMBEDDING_BASE_URL=http://host.docker.internal:8800/v1`. Si se usa el servidor remoto autorizado, poner su URL HTTPS; el Markdown extraído se enviará allí.
-3. Confirmar `EMBEDDING_MODEL=embedding` o cambiarlo por el ID exacto que acepte `/v1/embeddings`.
+1. Copiar `.env.example` a `.env` y `.env.runtime.example` a `.env.runtime`. Reemplazar los secretos de API y PostgreSQL por valores aleatorios; la contraseña incluida en `DATABASE_URL` debe coincidir con `POSTGRES_PASSWORD`. Configurar `EMBEDDING_API_KEY` sin versionar los archivos.
+2. Para Jina local en el host, configura `EMBEDDING_PROVIDER=jina-local`, `EMBEDDING_BASE_URL=http://host.docker.internal:8000/v1`, `EMBEDDING_MODEL=jinaai/jina-embeddings-v5-omni-nano`, `EMBEDDING_DOCUMENT_MODE=direct` y `EMBEDDING_DIMENSIONS=768`. En Ajustes elige Jina y modo multimodal directo. Otros proveedores requieren modo texto.
+3. Cambiar de modelo/dimensiones requiere un índice Elasticsearch nuevo y reindexar documentos. El ejemplo usa `invoices-poc-jina-omni-v5-768`; la aplicación rechaza un índice cuyo vector no coincide con `EMBEDDING_DIMENSIONS`.
 4. Ejecuta `docker compose up --build` y abre `http://127.0.0.1:8080`. Elasticsearch y Azurite se ejecutan localmente para desarrollo; PostgreSQL guarda la cola y Azurite los PDFs originales.
-5. Subir PDFs digitales. Los escaneados se marcan como fallidos con mensaje de OCR desactivado. Buscar conceptos en lenguaje natural y abrir los PDFs originales desde los resultados.
+5. En modo directo se admiten PDFs y PNG/JPEG/WEBP; en modo texto, PDFs con texto extraíble. Buscar conceptos y abrir los originales desde los resultados.
 
-La subida acepta una firma `%PDF-` dentro de los primeros 1024 bytes, para archivos con preámbulo MIME corto; guarda solo desde la firma. La API devuelve un resultado por fichero (`queued`, `duplicate` o `rejected`) para que un archivo inválido no cancele el resto del bloque. `MAX_UPLOAD_MB` se aplica a cada PDF y `MAX_BATCH_FILES` limita el número por petición. La interfaz muestra el envío, los errores HTTP y páginas de 50 documentos.
+La subida acepta una firma `%PDF-` dentro de los primeros 1024 bytes, para archivos con preámbulo MIME corto; guarda solo desde la firma. La API devuelve un resultado por fichero (`queued`, `duplicate` o `rejected`) para que un archivo inválido no cancele el resto del bloque. `MAX_UPLOAD_MB` se aplica a cada archivo y `MAX_BATCH_FILES` limita el número por petición. La interfaz muestra el envío, los errores HTTP y páginas de 50 documentos.
 
 ## API y MCP
 
@@ -28,19 +28,19 @@ Configura `API_TOKEN` en el entorno del servicio con un secreto aleatorio. Todos
 
 Swagger UI está disponible en `/api/docs`, la especificación OpenAPI en `/api/openapi.json` y ReDoc en `/api/redoc`. En Swagger, pulsa **Authorize** e introduce el token Bearer. La especificación describe la API REST; las herramientas MCP se consultan mediante MCP `tools/list`.
 
-La API REST acepta PDFs como `multipart/form-data` en `POST /api/documents`, usando el campo repetido `files`. Devuelve identificadores para consultar individualmente `GET /api/documents/{id}`. El listado admite `limit` (1-200), `offset` y filtro `status`. La búsqueda es `POST /api/search`.
+La API REST acepta PDFs e imágenes compatibles como `multipart/form-data` en `POST /api/documents`, usando el campo repetido `files`. Las imágenes se validan como PNG/JPEG/WEBP y requieren Jina en modo directo. Devuelve identificadores para consultar individualmente `GET /api/documents/{id}`. El listado admite `limit` (1-200), `offset` y filtro `status`. La búsqueda es `POST /api/search`.
 
 El servidor MCP usa Streamable HTTP en `/mcp` y publica las herramientas `index_invoice` (un PDF por llamada, codificado en base64), `get_invoice_status` y `semantic_search`. Para archivos grandes, usa el endpoint REST multipart: el transporte MCP tiene un límite de tamaño de mensaje del SDK, por lo que no debe usarse para PDFs grandes.
 
-Para desplegar detrás de un proxy HTTPS, conserva `APP_BIND_ADDRESS=127.0.0.1` si el proxy corre en el host. Configúralo como `0.0.0.0` solo si el puerto está protegido por firewall y terminado TLS por el proxy. Elasticsearch se configura mediante `ELASTICSEARCH_URL` y `ELASTICSEARCH_INDEX`; para un clúster protegido se puede usar `ELASTICSEARCH_API_KEY` o `ELASTICSEARCH_USERNAME` junto con `ELASTICSEARCH_PASSWORD`. El servicio de embeddings se apunta mediante `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL` y, si aplica, `EMBEDDING_API_KEY`; el índice vectorial actual requiere 1024 dimensiones. En despliegue, los PDFs se almacenan en Azure Blob Storage usando `AZURE_STORAGE_CONNECTION_STRING` y `AZURE_STORAGE_CONTAINER`.
+Para desplegar detrás de un proxy HTTPS, conserva `APP_BIND_ADDRESS=127.0.0.1` si el proxy corre en el host. Configúralo como `0.0.0.0` solo si el puerto está protegido por firewall y terminado TLS por el proxy. Elasticsearch se configura mediante `ELASTICSEARCH_URL` y `ELASTICSEARCH_INDEX`; para un clúster protegido se puede usar `ELASTICSEARCH_API_KEY` o `ELASTICSEARCH_USERNAME` junto con `ELASTICSEARCH_PASSWORD`. El servicio de embeddings se apunta mediante `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL` y, si aplica, `EMBEDDING_API_KEY`; `EMBEDDING_DIMENSIONS` debe coincidir con la mapping. En despliegue, PDFs e imágenes originales se almacenan en Azure Blob Storage usando `AZURE_STORAGE_CONNECTION_STRING` y `AZURE_STORAGE_CONTAINER`.
 
 ### Portainer
 
-Despliega `docker-compose.portainer.yml` desde el repositorio Git para que Portainer pueda construir las imágenes desde el `Dockerfile`. Define en las variables del Stack: `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL`, `API_TOKEN`, `ELASTICSEARCH_URL`, `AZURE_STORAGE_CONNECTION_STRING`, `AZURE_STORAGE_CONTAINER`, `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`, y las claves opcionales de Elasticsearch/embeddings. Usa secretos de Portainer para contraseñas, tokens y connection string. `DATABASE_URL` debe apuntar al servicio `postgres` del stack y su contraseña debe coincidir con `POSTGRES_PASSWORD`. Elasticsearch y Azure Blob son dependencias externas y deben ser accesibles desde la red Docker. Configura `APP_BIND_ADDRESS=0.0.0.0` si el proxy no comparte el host; protege entonces el puerto con firewall y TLS en el proxy.
+Despliega `docker-compose.portainer.yml` desde el repositorio Git para que Portainer pueda construir las imágenes desde el `Dockerfile`. Define en las variables del Stack: `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL`, `API_TOKEN`, `ELASTICSEARCH_URL`, `ELASTICSEARCH_INDEX`, `AZURE_STORAGE_CONNECTION_STRING`, `AZURE_STORAGE_CONTAINER`, `EMBEDDING_PROVIDER`, `EMBEDDING_DOCUMENT_MODE`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`, y las claves opcionales de Elasticsearch/embeddings. Para Jina Omni v5 usa un índice nuevo con `EMBEDDING_DIMENSIONS=768`; la dimensión debe coincidir con la mapping del índice. Usa secretos de Portainer para contraseñas, tokens y connection string. `DATABASE_URL` debe apuntar al servicio `postgres` del stack y su contraseña debe coincidir con `POSTGRES_PASSWORD`. Elasticsearch, Azure Blob y el servicio de embeddings son dependencias externas accesibles desde la red Docker. Configura `APP_BIND_ADDRESS=0.0.0.0` si el proxy no comparte el host; protege entonces el puerto con firewall y TLS en el proxy.
 
-La cola transaccional está en PostgreSQL y los originales en Azure Blob Storage; `FOR UPDATE SKIP LOCKED` permite varios workers sin reclamar dos veces un trabajo.
+La cola transaccional está en PostgreSQL y los originales en Azure Blob Storage; `FOR UPDATE SKIP LOCKED` permite varios workers sin reclamar dos veces un trabajo. La configuración del proveedor se persiste en el volumen compartido `embedding-settings-data` para que app y workers usen el mismo modo.
 
-El worker indexa un vector y el Markdown extraído por factura en Elasticsearch. La búsqueda combina BM25 y kNN cosine con RRF calculado en la aplicación (la licencia Basic de este nodo no permite RRF server-side); así los códigos/frases exactas se combinan con la similitud semántica. La puntuación RRF es un orden relativo, no certeza. No hay filtros CIF/cliente/fecha ni extracción de metadatos del nombre todavía.
+El worker indexa un vector y, si está disponible, texto extraído en Elasticsearch. La búsqueda combina BM25 y kNN cosine con RRF calculado en la aplicación (la licencia Basic de este nodo no permite RRF server-side); así los códigos/frases exactas se combinan con la similitud semántica. La puntuación RRF es un orden relativo, no certeza. No hay filtros CIF/cliente/fecha ni extracción de metadatos del nombre todavía.
 
 ## Diagnóstico y datos
 
@@ -73,8 +73,8 @@ Los filenames anteriores son marcadores de posición, no resultados esperados.
 
 Después, con la aplicación activa, ejecuta `python3 scripts/evaluate_search.py casos.json`. Informa Recall@5/10, latencia, top 10 y puede exigir `expected_top1`. Hay un caso de regresión etiquetado; añade más juicios humanos para medir generalización, no interpretes un único caso como evaluación representativa.
 
-## Diferencia con el requisito inicial
+## Modos y límites
 
-Esta ruta sustituye la entrada multimodal por extracción de texto del PDF. Es útil para avanzar con facturas digitales, pero **no satisface el requisito original de embeddings visuales del PDF**, especialmente para escaneos, sellos, distribución visual o información gráfica. MarkItDown declara que su salida es Markdown para análisis de texto, no una conversión visual fiel. Para volver a la aceptación multimodal hace falta un endpoint que procese PDF/páginas visuales con una ruta de modelo documentada y validada.
+El modo texto sigue limitado por MarkItDown y no procesa PDFs escaneados sin OCR. El modo Jina directo ya envía PDFs e imágenes al modelo visual; las consultas de texto y documentos visuales deben usar el mismo modelo e índice vectorial. En CPU, la inferencia puede tardar minutos, por lo que el timeout se configura a 300 segundos por defecto.
 
-Fuentes: [MarkItDown](https://github.com/microsoft/markitdown), [implementación del conversor PDF](https://github.com/microsoft/markitdown/blob/main/packages/markitdown/src/markitdown/converters/_pdf_converter.py), [Qwen3-Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B), [Jina Omni MLX](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small-retrieval-mlx).
+Fuentes: [MarkItDown](https://github.com/microsoft/markitdown), [Jina Embeddings v5 Omni Nano](https://huggingface.co/jinaai/jina-embeddings-v5-omni-nano).

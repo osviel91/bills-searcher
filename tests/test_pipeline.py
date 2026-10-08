@@ -1,11 +1,13 @@
 import tempfile
 import unittest
+from io import BytesIO
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 import app
 import worker
@@ -68,6 +70,20 @@ class PipelineTests(unittest.TestCase):
         with patch.object(app, "MAX_BYTES", 4):
             large = self.client.post("/api/documents", files={"files": ("large.pdf", b"%PDF-1.4", "application/pdf")}, headers=self.auth)
         self.assertEqual(large.json()["documents"][0]["status"], "rejected")
+
+    def test_image_upload_requires_direct_mode_and_queues_valid_png(self):
+        image = BytesIO()
+        Image.new("RGB", (2, 2), "red").save(image, format="PNG")
+        payload = image.getvalue()
+        with patch.object(app, "embedding_settings", return_value={"provider": "jina-local", "document_mode": "direct"}):
+            accepted = self.client.post("/api/documents", files={"files": ("invoice.png", payload, "image/png")}, headers=self.auth)
+        self.assertEqual(accepted.json()["documents"][0]["status"], "queued")
+        self.assertTrue(app.put_object.call_args.args[0].endswith(".png"))
+        self.assertEqual(app.put_object.call_args.args[2], "image/png")
+
+        with patch.object(app, "embedding_settings", return_value={"provider": "jina-local", "document_mode": "text"}):
+            rejected = self.client.post("/api/documents", files={"files": ("invoice.png", payload, "image/png")}, headers=self.auth)
+        self.assertEqual(rejected.json()["documents"][0]["status"], "rejected")
 
     def test_search_generates_query_vector_and_returns_document(self):
         response = self.client.post("/api/search", json={"query": "reparación de impresoras", "limit": 5}, headers=self.auth)

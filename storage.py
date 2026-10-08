@@ -3,6 +3,7 @@ import os
 from elasticsearch import Elasticsearch
 
 INDEX = os.getenv("ELASTICSEARCH_INDEX", "invoices-poc-v1")
+EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
 ES_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
 ES_API_KEY = os.getenv("ELASTICSEARCH_API_KEY", "")
 ES_USERNAME = os.getenv("ELASTICSEARCH_USERNAME", "")
@@ -25,10 +26,14 @@ def initialize_index(es):
                 "filename": {"type": "keyword"},
                 "model": {"type": "keyword"},
                 "content": {"type": "text"},
-                "embedding": {"type": "dense_vector", "dims": 1024, "index": True, "similarity": "cosine"},
+                "embedding": {"type": "dense_vector", "dims": EMBEDDING_DIMENSIONS, "index": True, "similarity": "cosine"},
             }})
         except Exception:
             if not es.indices.exists(index=INDEX):
                 raise
     else:
+        mapping = es.indices.get_mapping(index=INDEX)[INDEX]["mappings"]["properties"]
+        actual_dimensions = mapping.get("embedding", {}).get("dims")
+        if actual_dimensions != EMBEDDING_DIMENSIONS:
+            raise ValueError(f"El índice {INDEX} tiene {actual_dimensions} dimensiones; configura uno nuevo para {EMBEDDING_DIMENSIONS}")
         es.indices.put_mapping(index=INDEX, properties={"content": {"type": "text"}})

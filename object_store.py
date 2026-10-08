@@ -26,9 +26,9 @@ def ensure_container(service=None):
     return container
 
 
-def put(key: str, data: bytes):
+def put(key: str, data: bytes, content_type="application/pdf"):
     container_client().upload_blob(key, data, overwrite=True,
-                                   content_settings=ContentSettings(content_type="application/pdf"))
+                                   content_settings=ContentSettings(content_type=content_type))
 
 
 def get(key: str):

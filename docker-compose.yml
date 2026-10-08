@@ -36,6 +36,8 @@ services:
       - path: .env.runtime
     ports:
       - "${APP_BIND_ADDRESS:-127.0.0.1}:8080:8000"
+    volumes:
+      - embedding-settings-data:/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -47,6 +49,8 @@ services:
   worker:
     build: .
     command: python worker.py
+    volumes:
+      - embedding-settings-data:/data
     environment:
       AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
       AZURE_STORAGE_CONTAINER: invoice-pdfs
@@ -82,3 +86,4 @@ volumes:
   elasticsearch-data:
   postgres-data:
   azurite-data:
+  embedding-settings-data:
