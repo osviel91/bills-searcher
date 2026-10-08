@@ -1,0 +1,84 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    env_file:
+      - path: .env
+        required: false
+      - path: .env.runtime
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+    command: azurite-blob --blobHost 0.0.0.0 --location /data --skipApiVersionCheck
+    volumes:
+      - azurite-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "const s=require('net').connect(10000,'127.0.0.1');s.on('connect',()=>process.exit(0));s.on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build: .
+    command: uvicorn app:app --host 0.0.0.0 --port 8000
+    environment:
+      AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+      AZURE_STORAGE_CONTAINER: invoice-pdfs
+    env_file:
+      - path: .env
+        required: false
+      - path: .env.runtime
+    ports:
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:8080:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      azurite:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: python worker.py
+    environment:
+      AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+      AZURE_STORAGE_CONTAINER: invoice-pdfs
+    env_file:
+      - path: .env
+        required: false
+      - path: .env.runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+      azurite:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.4
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -q 'status'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  elasticsearch-data:
+  postgres-data:
+  azurite-data:

@@ -1,0 +1,10 @@
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+elasticsearch==8.17.1
+httpx==0.28.1
+python-multipart==0.0.20
+markitdown[pdf]==0.1.6
+mcp==1.12.4
+pydantic==2.13.5
+azure-storage-blob==12.31.0
+psycopg[binary]==3.2.6
