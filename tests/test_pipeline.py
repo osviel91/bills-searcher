@@ -95,6 +95,49 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("content", str(lexical["query"]))
         self.assertIn("knn", semantic)
 
+    def test_direct_invoice_filter_uses_structured_fields_and_returns_total(self):
+        self.es.search.return_value = {"hits": {"total": {"value": 1}, "hits": [{
+            "_source": {"invoice_id": "invoice-1", "customer_code": "001234"},
+        }]}}
+        result = app.run_invoice_filter(customer_code="001234", concept="wallet comida",
+                                        invoice_date_from="2026-01-01", total_payable_min=10,
+                                        limit=20, offset=40)
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["results"][0]["file_url"], "/api/documents/invoice-1/file")
+        request = self.es.search.call_args.kwargs
+        self.assertEqual(request["from_"], 40)
+        self.assertIn("customer_code", str(request["query"]))
+        self.assertIn("concepts", str(request["query"]))
+
+    def test_evidence_search_returns_passage_with_traceable_offsets(self):
+        hit = {"_id": "invoice-1:generation:0", "_score": 0.7, "_source": {
+            "invoice_id": "invoice-1", "filename": "invoice.pdf", "chunk_index": 0,
+            "start_offset": 120, "end_offset": 154, "content": "Concepto: mantenimiento de equipos",
+        }}
+        self.es.search.return_value = {"hits": {"hits": [hit]}}
+
+        result = app.run_invoice_evidence_search("mantenimiento", invoice_id="invoice-1")
+
+        self.assertEqual(result["evidence"][0]["content"], "Concepto: mantenimiento de equipos")
+        self.assertEqual(result["evidence"][0]["start_offset"], 120)
+        self.assertEqual(self.es.search.call_count, 2)
+        self.assertIn("active", str(self.es.search.call_args_list[1].kwargs["knn"]["filter"]))
+
+    def test_reindex_invoices_requeues_existing_indexed_documents(self):
+        with closing(app.connect()) as db:
+            for doc_id, status in (("old-1", "indexed"), ("old-2", "indexed"), ("queued", "queued")):
+                db.execute("INSERT INTO jobs(id,sha256,filename,object_key,status) VALUES(?,?,?,?,?)",
+                           (doc_id, doc_id, f"{doc_id}.pdf", f"documents/{doc_id}.pdf", status))
+            db.commit()
+
+        result = app.reindex_invoices()
+
+        self.assertEqual(result["requeued"], 2)
+        with closing(app.connect()) as db:
+            statuses = {row["id"]: row["status"] for row in db.execute("SELECT id,status FROM jobs")}
+        self.assertEqual(statuses, {"old-1": "queued", "old-2": "queued", "queued": "queued"})
+
     def test_protected_endpoints_require_token_and_documents_are_paginated(self):
         unauthorized = self.client.get("/api/documents")
         self.assertEqual(unauthorized.status_code, 401)
@@ -142,9 +185,10 @@ class PipelineTests(unittest.TestCase):
                 db.execute("INSERT INTO jobs(id,sha256,filename,object_key,status) VALUES(?,?,?,?,?)", ("blank", "hash2", "blank.pdf", "documents/blank.pdf", "processing"))
                 db.commit()
             worker_es = Mock()
+            worker_es.update_by_query.return_value = {"failures": []}
             good_markdown = Mock(convert_local=Mock(return_value=SimpleNamespace(markdown="Maintenance of printers")))
             blank_markdown = Mock(convert_local=Mock(return_value=SimpleNamespace(markdown="  ")))
-            with patch.object(worker, "client", return_value=worker_es), patch.object(worker, "initialize_index"), patch.object(worker, "embed", return_value=[0.5] * 1024) as embed_mock, patch.object(worker, "get_object", return_value=SimpleNamespace(readall=lambda: b"pdf")):
+            with patch.object(worker, "client", return_value=worker_es), patch.object(worker, "initialize_index"), patch.object(worker, "embed", return_value=[0.5] * 1024) as embed_mock, patch.object(worker, "embed_many", return_value=[[0.5] * 1024]) as embed_many_mock, patch.object(worker, "get_object", return_value=SimpleNamespace(readall=lambda: b"pdf")):
                 with patch.object(worker, "MarkItDown", return_value=good_markdown):
                     worker.process({"id": "good", "sha256": "hash1", "filename": "good.pdf", "object_key": "documents/good.pdf"})
                 with patch.object(worker, "MarkItDown", return_value=blank_markdown):
@@ -157,7 +201,14 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("OCR está desactivado", error)
             indexed_document = worker_es.index.call_args.kwargs["document"]
             self.assertEqual(indexed_document["content"], "Maintenance of printers")
+            self.assertEqual(indexed_document["concepts"], [])
+            self.assertEqual(indexed_document["confidence"], {})
             embed_mock.assert_called_once_with("Maintenance of printers")
+            embed_many_mock.assert_called_once_with(["Maintenance of printers"])
+            passage_document = worker_es.index.call_args_list[0].kwargs["document"]
+            self.assertFalse(passage_document["active"])
+            self.assertEqual(passage_document["content"], "Maintenance of printers")
+            worker_es.update_by_query.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

@@ -76,6 +76,34 @@ def embed(text: str, *, query: bool = False) -> list[float]:
     return vector
 
 
+def embed_many(texts: list[str]) -> list[list[float]]:
+    if not texts:
+        return []
+    config = settings()
+    headers = {"Accept": "application/json"}
+    if config["api_key"]:
+        headers["Authorization"] = f"Bearer {config['api_key']}"
+    payload = {"model": config["model"], "input": texts}
+    if config["provider"] == "jina-local":
+        payload.update(input_type="document", dimensions=DIMENSIONS)
+    else:
+        payload.update(max_length=32768, truncation=False)
+    response = httpx.post(f"{config['base_url']}/embeddings", headers=headers,
+                          json=payload, timeout=TIMEOUT)
+    response.raise_for_status()
+    data = response.json()["data"]
+    if len(data) != len(texts):
+        raise ValueError("El proveedor no devolvió un vector por fragmento")
+    if all("index" in item for item in data):
+        data.sort(key=lambda item: item["index"])
+    vectors = [item["embedding"] for item in data]
+    if any(len(vector) != DIMENSIONS or not all(
+        isinstance(value, (int, float)) and math.isfinite(value) for value in vector
+    ) for vector in vectors):
+        raise ValueError(f"El proveedor no devolvió vectores válidos de {DIMENSIONS} dimensiones")
+    return vectors
+
+
 def embed_file(data: bytes, content_type: str, document_id: str) -> list[float]:
     config = settings()
     if config["provider"] != "jina-local" or config["document_mode"] != "direct":

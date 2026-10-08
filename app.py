@@ -7,7 +7,7 @@ import os
 import uuid
 from io import BytesIO
 from contextlib import asynccontextmanager, closing
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import quote
 from typing import Literal
@@ -26,7 +26,7 @@ from starlette.responses import StreamingResponse
 from embeddings import MODEL, available_models, embed, health as embedding_health, settings as embedding_settings, update_settings
 from jobstore import connect as connect_jobs
 from object_store import container_client, delete as delete_object, ensure_container, get as get_object, put as put_object
-from storage import INDEX, client as es, initialize_index
+from storage import INDEX, PASSAGES_INDEX, client as es, initialize_index
 
 DATA = Path(os.getenv("DATA_DIR", "/data"))
 DB = DATA / "jobs.sqlite3"
@@ -34,6 +34,11 @@ MAX_BYTES = int(os.getenv("MAX_UPLOAD_MB", "25")) * 1024 * 1024
 MAX_BATCH_FILES = int(os.getenv("MAX_BATCH_FILES", "100"))
 API_TOKEN = os.getenv("API_TOKEN", "")
 bearer_scheme = HTTPBearer(auto_error=False)
+INVOICE_SEARCH_FIELDS = [
+    "invoice_id", "filename", "invoice_number", "invoice_date", "customer_code",
+    "customer_tax_id", "delivery_note_ids", "concepts", "currency", "total_payable",
+    "invoice_total", "tax_base", "vat", "confidence", "evidence",
+]
 
 
 def validate_token(token: str | None):
@@ -78,7 +83,8 @@ app = FastAPI(
         "La búsqueda combina texto y vectores, y su puntuación es un ranking relativo. "
         "La API requiere `Authorization: Bearer <token>` salvo `/api/health`. "
         "El servidor MCP Streamable HTTP está disponible en `/mcp`; sus herramientas "
-        "son `index_invoice`, `get_invoice_status` y `semantic_search`."
+        "son `index_invoice`, `get_invoice_status`, `reindex_invoices`, `semantic_search`, "
+        "`search_invoice_evidence` y `filter_invoices`."
     ),
     version="1.0.0",
     openapi_url="/api/openapi.json",
@@ -157,6 +163,19 @@ class SearchResult(BaseModel):
     filename: str
     score: float = Field(description="Puntuación RRF relativa, no una probabilidad.")
     file_url: str
+    invoice_number: str | None = None
+    invoice_date: str | None = None
+    customer_code: str | None = None
+    customer_tax_id: str | None = None
+    delivery_note_ids: list[str] = Field(default_factory=list)
+    concepts: list[str] = Field(default_factory=list)
+    currency: str | None = None
+    total_payable: float | None = None
+    invoice_total: float | None = None
+    tax_base: float | None = None
+    vat: float | None = None
+    confidence: dict = Field(default_factory=dict)
+    evidence: dict = Field(default_factory=dict)
 
 
 class SearchResponse(BaseModel):
@@ -178,7 +197,7 @@ def reciprocal_rank_fusion(*rankings, limit):
     fused = {}
     for hits in rankings:
         for rank, hit in enumerate(hits, start=1):
-            item = fused.setdefault(hit["_id"], {"_source": hit["_source"], "_score": 0.0})
+            item = fused.setdefault(hit["_id"], {"_id": hit["_id"], "_source": hit["_source"], "_score": 0.0})
             item["_score"] += 1 / (60 + rank)
     return sorted(fused.values(), key=lambda item: item["_score"], reverse=True)[:limit]
 
@@ -443,16 +462,89 @@ def run_search(query: str, limit: int):
         lexical = es_client.search(index=INDEX, size=window, query={"bool": {"should": [
             {"match": {"content": {"query": query, "operator": "or"}}},
             {"match_phrase": {"content": {"query": query, "slop": 3, "boost": 4}}},
-        ], "minimum_should_match": 1}}, source=["invoice_id", "filename"])
+        ], "minimum_should_match": 1}}, source=INVOICE_SEARCH_FIELDS)
         semantic = es_client.search(index=INDEX, size=window, knn={
             "field": "embedding", "query_vector": vector,
             "k": window, "num_candidates": max(100, limit * 10),
-        }, source=["invoice_id", "filename"])
+        }, source=INVOICE_SEARCH_FIELDS)
         hits = reciprocal_rank_fusion(lexical["hits"]["hits"], semantic["hits"]["hits"], limit=limit)
     except Exception as error:
         raise HTTPException(503, f"No se pudo completar la búsqueda: {type(error).__name__}") from error
     return {"results": [
         {**hit["_source"], "score": hit["_score"], "file_url": f"/api/documents/{hit['_source']['invoice_id']}/file"}
+        for hit in hits
+    ]}
+
+
+def run_invoice_filter(*, customer_code=None, customer_tax_id=None, invoice_number=None,
+                       delivery_note_id=None, concept=None, currency=None, invoice_date_from=None,
+                       invoice_date_to=None, total_payable_min=None, total_payable_max=None,
+                       limit=50, offset=0):
+    filters = []
+    for field, value in (("customer_code", customer_code), ("customer_tax_id", customer_tax_id),
+                         ("invoice_number", invoice_number), ("delivery_note_ids", delivery_note_id),
+                         ("currency", currency)):
+        if value:
+            filters.append({"term": {field: value}})
+    if invoice_date_from or invoice_date_to:
+        date_range = {}
+        if invoice_date_from:
+            date_range["gte"] = invoice_date_from
+        if invoice_date_to:
+            date_range["lte"] = invoice_date_to
+        filters.append({"range": {"invoice_date": date_range}})
+    if total_payable_min is not None or total_payable_max is not None:
+        amount_range = {}
+        if total_payable_min is not None:
+            amount_range["gte"] = total_payable_min
+        if total_payable_max is not None:
+            amount_range["lte"] = total_payable_max
+        filters.append({"range": {"total_payable": amount_range}})
+    if concept:
+        filters.append({"match": {"concepts": {"query": concept, "operator": "and"}}})
+    try:
+        response = es().search(
+            index=INDEX, from_=offset, size=limit,
+            query={"bool": {"filter": filters}}, source=INVOICE_SEARCH_FIELDS,
+        )
+    except Exception as error:
+        raise HTTPException(503, f"No se pudo filtrar facturas: {type(error).__name__}") from error
+    return {"results": [
+                {**hit["_source"], "file_url": f"/api/documents/{hit['_source']['invoice_id']}/file"}
+                for hit in response["hits"]["hits"]
+            ],
+            "total": response["hits"]["total"]["value"], "limit": limit, "offset": offset}
+
+
+def run_invoice_evidence_search(query: str, limit: int = 5, invoice_id: str | None = None):
+    try:
+        vector = embed(query, query=True)
+        es_client = es()
+        filters = [{"term": {"active": True}}]
+        if invoice_id:
+            filters.append({"term": {"invoice_id": invoice_id}})
+        passage_filter = {"bool": {"filter": filters}}
+        window = max(20, limit * 5)
+        lexical = es_client.search(
+            index=PASSAGES_INDEX, size=window,
+            query={"bool": {"filter": filters, "should": [
+                {"match": {"content": {"query": query, "operator": "or"}}},
+                {"match_phrase": {"content": {"query": query, "slop": 3, "boost": 4}}},
+            ], "minimum_should_match": 1}},
+            source=["invoice_id", "filename", "chunk_index", "start_offset", "end_offset", "content"],
+        )
+        semantic = es_client.search(
+            index=PASSAGES_INDEX, size=window,
+            knn={"field": "embedding", "query_vector": vector, "k": window,
+                 "num_candidates": max(100, limit * 10), "filter": passage_filter},
+            source=["invoice_id", "filename", "chunk_index", "start_offset", "end_offset", "content"],
+        )
+        hits = reciprocal_rank_fusion(lexical["hits"]["hits"], semantic["hits"]["hits"], limit=limit)
+    except Exception as error:
+        raise HTTPException(503, f"No se pudo recuperar evidencia: {type(error).__name__}") from error
+    return {"evidence": [
+        {**hit["_source"], "passage_id": hit["_id"], "score": hit["_score"],
+         "file_url": f"/api/documents/{hit['_source']['invoice_id']}/file"}
         for hit in hits
     ]}
 
@@ -502,12 +594,74 @@ def get_invoice_status(document_id: str) -> dict:
 
 
 @mcp.tool()
+def reindex_invoices(document_id: str | None = None) -> dict:
+    """Reprocesa una factura por ID o todas las ya indexadas para extraer los campos estructurados."""
+    with closing(connect()) as db:
+        if document_id:
+            result = db.execute(
+                "UPDATE jobs SET status='queued',error=NULL WHERE id=? AND status IN ('indexed','failed')",
+                (document_id,),
+            )
+        else:
+            result = db.execute("UPDATE jobs SET status='queued',error=NULL WHERE status='indexed'")
+        db.commit()
+        if result.rowcount:
+            return {"requeued": result.rowcount, **({"id": document_id, "status": "queued"} if document_id else {})}
+        if document_id:
+            row = db.execute("SELECT status FROM jobs WHERE id=?", (document_id,)).fetchone()
+            return {"id": document_id, "status": row["status"]} if row else {"error": "Documento no encontrado"}
+    return {"requeued": 0}
+
+
+@mcp.tool()
 def semantic_search(query: str, limit: int = 10) -> dict:
     """Busca facturas por significado y texto; limit debe estar entre 1 y 50."""
     if not 1 <= limit <= 50:
         return {"error": "limit debe estar entre 1 y 50"}
     try:
         return run_search(query, limit)
+    except HTTPException as error:
+        return {"error": error.detail}
+
+
+@mcp.tool()
+def filter_invoices(customer_code: str | None = None, customer_tax_id: str | None = None,
+                    invoice_number: str | None = None, delivery_note_id: str | None = None,
+                    concept: str | None = None, currency: str | None = None,
+                    invoice_date_from: str | None = None,
+                    invoice_date_to: str | None = None, total_payable_min: float | None = None,
+                    total_payable_max: float | None = None, limit: int = 50, offset: int = 0) -> dict:
+    """Filtra facturas por campos extraídos. Valores extraídos incluyen confianza y evidencia; no son verificación contable."""
+    if not 1 <= limit <= 200 or offset < 0:
+        return {"error": "limit debe estar entre 1 y 200 y offset no puede ser negativo"}
+    try:
+        start = date.fromisoformat(invoice_date_from) if invoice_date_from else None
+        end = date.fromisoformat(invoice_date_to) if invoice_date_to else None
+    except ValueError:
+        return {"error": "Las fechas deben usar el formato YYYY-MM-DD"}
+    if start and end and start > end:
+        return {"error": "invoice_date_from no puede ser posterior a invoice_date_to"}
+    if total_payable_min is not None and total_payable_max is not None and total_payable_min > total_payable_max:
+        return {"error": "total_payable_min no puede superar total_payable_max"}
+    try:
+        return run_invoice_filter(
+            customer_code=customer_code, customer_tax_id=customer_tax_id,
+            invoice_number=invoice_number, delivery_note_id=delivery_note_id,
+            concept=concept, currency=currency, invoice_date_from=invoice_date_from,
+            invoice_date_to=invoice_date_to, total_payable_min=total_payable_min,
+            total_payable_max=total_payable_max, limit=limit, offset=offset,
+        )
+    except HTTPException as error:
+        return {"error": error.detail}
+
+
+@mcp.tool()
+def search_invoice_evidence(query: str, limit: int = 5, invoice_id: str | None = None) -> dict:
+    """Recupera pasajes como evidencia con score de ranking relativo y offsets sobre el texto extraído (no páginas)."""
+    if not query.strip() or not 1 <= limit <= 20:
+        return {"error": "query no puede estar vacío y limit debe estar entre 1 y 20"}
+    try:
+        return run_invoice_evidence_search(query, limit, invoice_id)
     except HTTPException as error:
         return {"error": error.detail}
 
