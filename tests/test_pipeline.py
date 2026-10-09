@@ -124,6 +124,33 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.es.search.call_count, 2)
         self.assertIn("active", str(self.es.search.call_args_list[1].kwargs["knn"]["filter"]))
 
+    def test_evidence_rest_endpoint_is_authenticated_and_validates_query(self):
+        with patch.object(app, "run_invoice_evidence_search", return_value={"evidence": []}) as search:
+            response = self.client.post("/api/search/evidence", json={"query": "mantenimiento", "limit": 3}, headers=self.auth)
+        self.assertEqual(response.status_code, 200, response.text)
+        search.assert_called_once_with("mantenimiento", 3, None)
+
+        invalid = self.client.post("/api/search/evidence", json={"query": "  "}, headers=self.auth)
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(self.client.post("/api/search/evidence", json={"query": "texto"}).status_code, 401)
+
+    def test_filter_rest_endpoint_validates_ranges_and_returns_page(self):
+        self.es.search.return_value = {"hits": {"total": {"value": 1}, "hits": [{
+            "_source": {"invoice_id": "invoice-1", "filename": "invoice.pdf", "customer_code": "001234"},
+        }]}}
+        response = self.client.post("/api/invoices/filter", json={
+            "customer_code": "001234", "invoice_date_from": "2026-01-01", "limit": 20,
+        }, headers=self.auth)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["total"], 1)
+        self.assertEqual(response.json()["results"][0]["file_url"], "/api/documents/invoice-1/file")
+        self.assertEqual(self.client.post("/api/invoices/filter", json={"customer_code": "001234"}).status_code, 401)
+
+        invalid = self.client.post("/api/invoices/filter", json={
+            "invoice_date_from": "2026-12-31", "invoice_date_to": "2026-01-01",
+        }, headers=self.auth)
+        self.assertEqual(invalid.status_code, 422)
+
     def test_reindex_invoices_requeues_existing_indexed_documents(self):
         with closing(app.connect()) as db:
             for doc_id, status in (("old-1", "indexed"), ("old-2", "indexed"), ("queued", "queued")):
@@ -163,6 +190,9 @@ class PipelineTests(unittest.TestCase):
         page = self.client.get("/").text
         self.assertIn("Enviando", page)
         self.assertIn("No se pudo subir", page)
+        self.assertIn("Buscar evidencia", page)
+        self.assertIn("/api/search/evidence", page)
+        self.assertIn("/api/invoices/filter", page)
 
     def test_swagger_docs_and_openapi_security_are_configured(self):
         docs = self.client.get("/api/docs")
@@ -177,6 +207,31 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("UploadResponse", schema["components"]["schemas"])
         self.assertIn("422", schema["paths"]["/api/search"]["post"]["responses"])
 
+    def test_worker_does_not_mark_job_indexed_when_passages_remain_inactive(self):
+        root = Path(self.temp.name)
+        with patch.object(worker, "DATA", root), patch.object(worker, "DB", root / "worker-publication.sqlite3"):
+            with closing(worker.connect()) as db:
+                db.execute("INSERT INTO jobs(id,sha256,filename,object_key,status) VALUES(?,?,?,?,?)",
+                           ("publication", "hash-publication", "publication.pdf", "documents/publication.pdf", "processing"))
+                db.commit()
+            worker_es = Mock()
+            worker_es.update_by_query.return_value = {"failures": [], "updated": 1}
+            worker_es.count.return_value = {"count": 0}
+            markdown = Mock(convert_local=Mock(return_value=SimpleNamespace(markdown="Synthetic invoice text")))
+            with patch.object(worker, "client", return_value=worker_es), patch.object(worker, "settings", return_value={
+                    "provider": "openai-compatible", "document_mode": "text", "model": "test-model"}), \
+                 patch.object(worker, "embed", return_value=[0.5] * 1024), \
+                 patch.object(worker, "embed_many", return_value=[[0.5] * 1024]), \
+                 patch.object(worker, "get_object", return_value=SimpleNamespace(readall=lambda: b"synthetic pdf")), \
+                 patch.object(worker, "MarkItDown", return_value=markdown):
+                worker.process({"id": "publication", "sha256": "hash-publication", "filename": "publication.pdf",
+                                "object_key": "documents/publication.pdf"})
+
+            with closing(worker.connect()) as db:
+                job = db.execute("SELECT status,error FROM jobs WHERE id='publication'").fetchone()
+            self.assertEqual(job["status"], "failed")
+            self.assertIn("pasajes activos", job["error"])
+
     def test_worker_indexes_markdown_embedding_and_marks_blank_pdf_failed(self):
         root = Path(self.temp.name)
         with patch.object(worker, "DATA", root), patch.object(worker, "DB", root / "worker.sqlite3"):
@@ -186,9 +241,10 @@ class PipelineTests(unittest.TestCase):
                 db.commit()
             worker_es = Mock()
             worker_es.update_by_query.return_value = {"failures": []}
+            worker_es.count.return_value = {"count": 1}
             good_markdown = Mock(convert_local=Mock(return_value=SimpleNamespace(markdown="Maintenance of printers")))
             blank_markdown = Mock(convert_local=Mock(return_value=SimpleNamespace(markdown="  ")))
-            with patch.object(worker, "client", return_value=worker_es), patch.object(worker, "initialize_index"), patch.object(worker, "embed", return_value=[0.5] * 1024) as embed_mock, patch.object(worker, "embed_many", return_value=[[0.5] * 1024]) as embed_many_mock, patch.object(worker, "get_object", return_value=SimpleNamespace(readall=lambda: b"pdf")):
+            with patch.object(worker, "client", return_value=worker_es), patch.object(worker, "initialize_index"), patch.object(worker, "settings", return_value={"provider": "openai-compatible", "document_mode": "text", "model": "test-model"}), patch.object(worker, "embed", return_value=[0.5] * 1024) as embed_mock, patch.object(worker, "embed_many", return_value=[[0.5] * 1024]) as embed_many_mock, patch.object(worker, "get_object", return_value=SimpleNamespace(readall=lambda: b"pdf")):
                 with patch.object(worker, "MarkItDown", return_value=good_markdown):
                     worker.process({"id": "good", "sha256": "hash1", "filename": "good.pdf", "object_key": "documents/good.pdf"})
                 with patch.object(worker, "MarkItDown", return_value=blank_markdown):

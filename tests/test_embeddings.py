@@ -37,8 +37,10 @@ class EmbeddingTests(unittest.TestCase):
     def test_discovers_and_sorts_model_ids(self, get):
         self.assertEqual(available_models(), ["a-model", "z-model"])
 
+    @patch("embeddings.settings", return_value={"provider": "openai-compatible", "base_url": "http://embed/v1",
+                                                 "model": "test-model", "api_key": ""})
     @patch("embeddings.httpx.post")
-    def test_query_adds_retrieval_instruction_and_checks_vector(self, post):
+    def test_query_adds_retrieval_instruction_and_checks_vector(self, post, _settings):
         post.return_value = Response([0.0] * DIMENSIONS)
 
         vector = embed("reparación de impresoras", query=True)

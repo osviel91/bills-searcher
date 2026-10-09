@@ -117,6 +117,27 @@ class SearchRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=50, description="Máximo de resultados que se devolverán.")
 
 
+class EvidenceSearchRequest(BaseModel):
+    query: str = Field(min_length=1, description="Texto para recuperar pasajes de evidencia.")
+    limit: int = Field(default=5, ge=1, le=20)
+    invoice_id: str | None = None
+
+
+class InvoiceFilterRequest(BaseModel):
+    customer_code: str | None = None
+    customer_tax_id: str | None = None
+    invoice_number: str | None = None
+    delivery_note_id: str | None = None
+    concept: str | None = None
+    currency: str | None = None
+    invoice_date_from: date | None = None
+    invoice_date_to: date | None = None
+    total_payable_min: float | None = None
+    total_payable_max: float | None = None
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+
+
 class EmbeddingSettings(BaseModel):
     provider: Literal["openai-compatible", "jina-local"] = "openai-compatible"
     document_mode: Literal["text", "direct"] = "text"
@@ -549,6 +570,33 @@ def run_invoice_evidence_search(query: str, limit: int = 5, invoice_id: str | No
     ]}
 
 
+@app.post("/api/search/evidence", dependencies=[Depends(require_token)], tags=["Búsqueda"],
+          summary="Recuperar pasajes de evidencia", responses={401: {"model": ApiError}, 503: {"model": ApiError}})
+def search_evidence(request: EvidenceSearchRequest):
+    if not request.query.strip():
+        raise HTTPException(422, "query no puede estar vacío")
+    return run_invoice_evidence_search(request.query, request.limit, request.invoice_id)
+
+
+@app.post("/api/invoices/filter", dependencies=[Depends(require_token)], tags=["Búsqueda"],
+          summary="Filtrar facturas por campos extraídos", responses={401: {"model": ApiError}, 503: {"model": ApiError}})
+def filter_invoices_rest(request: InvoiceFilterRequest):
+    if request.invoice_date_from and request.invoice_date_to and request.invoice_date_from > request.invoice_date_to:
+        raise HTTPException(422, "invoice_date_from no puede ser posterior a invoice_date_to")
+    if (request.total_payable_min is not None and request.total_payable_max is not None
+            and request.total_payable_min > request.total_payable_max):
+        raise HTTPException(422, "total_payable_min no puede superar total_payable_max")
+    return run_invoice_filter(
+        customer_code=request.customer_code, customer_tax_id=request.customer_tax_id,
+        invoice_number=request.invoice_number, delivery_note_id=request.delivery_note_id,
+        concept=request.concept, currency=request.currency,
+        invoice_date_from=request.invoice_date_from.isoformat() if request.invoice_date_from else None,
+        invoice_date_to=request.invoice_date_to.isoformat() if request.invoice_date_to else None,
+        total_payable_min=request.total_payable_min, total_payable_max=request.total_payable_max,
+        limit=request.limit, offset=request.offset,
+    )
+
+
 @mcp.tool()
 def index_invoice(filename: str, content_base64: str) -> dict:
     """Encola un PDF individual enviado como base64 y devuelve su estado."""
@@ -686,5 +734,23 @@ async function download(url,name){const r=await api(url);if(!r.ok)return;const l
 async function refresh(){if(!hasToken())return;const response=await api(`/api/documents?limit=${pageSize}&offset=${offset}`);if(!response.ok)return;const d=await response.json();total=d.total;const list=document.querySelector('#docs');list.replaceChildren();for(const x of d.documents){const li=el('li','');const a=el('a',x.filename);a.href=`/api/documents/${x.id}/file`;a.onclick=e=>{e.preventDefault();download(a.href,x.filename)};li.append(a,document.createTextNode(` · ${x.status}${x.error?` · ${x.error}`:''} `));if(x.status==='failed'){const b=el('button','Reintentar');b.onclick=()=>api(`/api/documents/${x.id}/retry`,{method:'POST'}).then(refresh);li.append(b)}list.append(li)}document.querySelector('#page').textContent=`${total} documentos · ${total?offset+1:0}-${Math.min(offset+pageSize,total)}`;document.querySelector('#previous').disabled=offset===0;document.querySelector('#next').disabled=offset+pageSize>=total}
 document.querySelector('#previous').onclick=()=>{offset=Math.max(0,offset-pageSize);refresh()};document.querySelector('#next').onclick=()=>{offset+=pageSize;refresh()};document.querySelector('#upload').onclick=async()=>{const files=document.querySelector('#files').files;const status=document.querySelector('#upload-status');if(!files.length){status.textContent='Selecciona al menos un PDF.';return}const body=new FormData();for(const f of files)body.append('files',f);status.textContent=`Enviando ${files.length} archivo(s)…`;try{const r=await api('/api/documents',{method:'POST',body});const d=await r.json();if(!r.ok)throw Error(d.detail||'Error al subir');status.textContent=`${d.accepted} en cola, ${d.duplicates} duplicados, ${d.rejected} rechazados.`;refresh()}catch(e){status.textContent=`No se pudo subir: ${e.message}`}};
 document.querySelector('#search').onsubmit=async e=>{e.preventDefault();const list=document.querySelector('#results');const panel=document.querySelector('#results-panel');panel.classList.remove('hidden');list.replaceChildren(el('li','Buscando…'));try{const r=await api('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:document.querySelector('#query').value})});const d=await r.json();list.replaceChildren();if(!r.ok)throw Error(d.detail||'Error en búsqueda');if(!d.results.length)list.append(el('li','No se encontraron facturas.'));for(const x of d.results){const li=el('li','');const a=el('a',x.filename);a.href=x.file_url;a.onclick=ev=>{ev.preventDefault();download(a.href,x.filename)};li.append(a,document.createTextNode(` · relevancia ${x.score.toFixed(4)}`));list.append(li)}}catch(error){list.replaceChildren(el('li',error.message))}};
-authUI(false);if(hasToken())document.querySelector('#save-token').click();setInterval(refresh,5000);
+ const searchForm=document.querySelector('#search'),results=document.querySelector('#results'),resultsPanel=document.querySelector('#results-panel');let searchMode='semantic',filterOffset=0,filterPayload={};
+ const modeBar=document.createElement('div');modeBar.className='tabs';modeBar.setAttribute('aria-label','Tipo de búsqueda');const modeButtons={};
+ for(const [mode,label] of [['semantic','Facturas'],['evidence','Evidencia'],['filters','Filtros']]){const button=el('button',label);button.type='button';button.className='tab'+(mode===searchMode?' active':'');button.setAttribute('aria-pressed',String(mode===searchMode));modeBar.append(button);modeButtons[mode]=button;button.onclick=()=>{searchMode=mode;for(const [key,item] of Object.entries(modeButtons)){item.classList.toggle('active',key===mode);item.setAttribute('aria-pressed',String(key===mode))}searchForm.classList.toggle('hidden',mode==='filters');filterForm.classList.toggle('hidden',mode!=='filters');document.querySelector('#search button').textContent=mode==='evidence'?'Buscar evidencia':'Buscar facturas';document.querySelector('#query').placeholder=mode==='evidence'?'Ej. importe y concepto que quieres localizar':'Ej. mantenimiento de impresoras';resultsPanel.classList.add('hidden')}}
+ searchForm.before(modeBar);
+ const filterForm=document.createElement('form');filterForm.className='panel hidden';filterForm.setAttribute('aria-label','Filtros de facturas');const filterGrid=document.createElement('div');filterGrid.className='grid';
+ const filterFields=[['invoice_number','Número de factura','text'],['customer_code','Código de cliente','text'],['customer_tax_id','NIF de cliente','text'],['delivery_note_id','Albarán','text'],['concept','Concepto','text'],['currency','Moneda','text'],['invoice_date_from','Fecha desde','date'],['invoice_date_to','Fecha hasta','date'],['total_payable_min','Total a pagar desde','number'],['total_payable_max','Total a pagar hasta','number']];
+ for(const [name,label,type] of filterFields){const field=el('label',label);field.className='field';const input=document.createElement('input');input.name=name;input.type=type;if(type==='number'){input.step='0.01';input.min='0'}field.append(input);filterGrid.append(field)}
+ const filterSubmit=el('button','Aplicar filtros');filterSubmit.type='submit';filterSubmit.className='primary';filterForm.append(filterGrid,filterSubmit);searchForm.after(filterForm);
+ const filterPages=document.createElement('div');filterPages.className='actions';filterPages.hidden=true;const previousFilter=el('button','Anterior'),nextFilter=el('button','Siguiente'),filterPageLabel=el('span','');previousFilter.type=nextFilter.type='button';filterPages.append(previousFilter,filterPageLabel,nextFilter);results.after(filterPages);
+ const setResultNote=text=>{resultsPanel.querySelector('.hint').textContent=text};
+ const originalLink=(item,label=item.filename)=>{const link=el('a',label);link.href=item.file_url;link.onclick=event=>{event.preventDefault();download(link.href,item.filename)};return link};
+ const showResults=()=>resultsPanel.classList.remove('hidden');
+ function renderInvoice(item){const li=el('li','');li.append(originalLink(item),document.createTextNode(` · relevancia ${(item.score||0).toFixed(4)}`));const values=[['Nº',item.invoice_number],['Fecha',item.invoice_date],['Cliente',item.customer_code],['Total a pagar',item.total_payable==null?null:`${item.total_payable} ${item.currency||''}`]];const summary=values.filter(([,value])=>value).map(([label,value])=>`${label}: ${value}`).join(' · ');if(summary)li.append(el('p',summary));if(Object.keys(item.evidence||{}).length){const details=document.createElement('details'),title=el('summary','Confianza y evidencia extraída');details.append(title);for(const [field,value] of Object.entries(item.evidence)){const confidence=item.confidence?.[field];details.append(el('p',`${field}${confidence==null?'':` · confianza heurística ${confidence}`}: ${value}`))}li.append(details)}return li}
+ function renderEvidence(item){const li=el('li','');li.append(el('p',item.content),originalLink(item),document.createTextNode(` · relevancia ${(item.score||0).toFixed(4)} · caracteres ${item.start_offset}–${item.end_offset}`));return li}
+ async function loadFilterPage(offset){const response=await api('/api/invoices/filter',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...filterPayload,limit:50,offset})});const data=await response.json();if(!response.ok)throw Error(data.detail||'Error al filtrar facturas');filterOffset=data.offset;filterPages.hidden=false;previousFilter.disabled=filterOffset===0;nextFilter.disabled=filterOffset+data.limit>=data.total;filterPageLabel.textContent=`${data.total} facturas · ${data.total?filterOffset+1:0}-${Math.min(filterOffset+data.limit,data.total)}`;return data}
+ searchForm.onsubmit=async event=>{event.preventDefault();showResults();results.replaceChildren(el('li',searchMode==='evidence'?'Buscando pasajes…':'Buscando facturas…'));filterPages.hidden=true;try{const evidence=searchMode==='evidence',response=await api(evidence?'/api/search/evidence':'/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:document.querySelector('#query').value,...(evidence?{limit:10}:{})})}),data=await response.json();if(!response.ok)throw Error(data.detail||'Error en búsqueda');const items=evidence?data.evidence:data.results;results.replaceChildren();if(!items.length)results.append(el('li',evidence?'No se encontró evidencia textual.':'No se encontraron facturas.'));for(const item of items)results.append(evidence?renderEvidence(item):renderInvoice(item));setResultNote(evidence?'Offsets sobre el texto extraído; no corresponden a páginas del PDF. El ranking es relativo.':'La confianza de campos es heurística; la relevancia es un ranking, no una probabilidad.')}catch(error){results.replaceChildren(el('li',error.message))}};
+ filterForm.onsubmit=async event=>{event.preventDefault();filterPayload={};for(const [name,,type] of filterFields){const value=filterForm.elements[name].value.trim();if(value!=='')filterPayload[name]=type==='number'?Number(value):value}if(!Object.keys(filterPayload).length){showResults();results.replaceChildren(el('li','Introduce al menos un criterio de filtro.'));filterPages.hidden=true;return}showResults();results.replaceChildren(el('li','Filtrando facturas…'));setResultNote('Los campos proceden de extracción heurística; revisa su evidencia antes de usarlos.');try{const data=await loadFilterPage(0);results.replaceChildren();if(!data.results.length)results.append(el('li','No se encontraron facturas con esos criterios.'));for(const item of data.results)results.append(renderInvoice(item))}catch(error){results.replaceChildren(el('li',error.message));filterPages.hidden=true}};
+ previousFilter.onclick=async()=>{try{const data=await loadFilterPage(Math.max(0,filterOffset-50));results.replaceChildren(...data.results.map(renderInvoice))}catch(error){results.replaceChildren(el('li',error.message))}};nextFilter.onclick=async()=>{try{const data=await loadFilterPage(filterOffset+50);results.replaceChildren(...data.results.map(renderInvoice))}catch(error){results.replaceChildren(el('li',error.message))}};
+ authUI(false);if(hasToken())document.querySelector('#save-token').click();setInterval(refresh,5000);
 </script></html>'''

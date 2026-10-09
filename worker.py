@@ -69,10 +69,16 @@ def process(job):
             query={"term": {"invoice_id": job["id"]}},
             script={"source": "ctx._source.active = (ctx._source.generation == params.generation)",
                     "params": {"generation": generation}},
-            refresh=True, conflicts="proceed",
+            refresh=True,
         )
         if published.get("failures"):
             raise RuntimeError("No se pudieron publicar todos los pasajes de la factura")
+        active_passages = es.count(index=PASSAGES_INDEX, query={"bool": {"filter": [
+            {"term": {"invoice_id": job["id"]}}, {"term": {"generation": generation}},
+            {"term": {"active": True}},
+        ]}})["count"]
+        if active_passages != len(passages):
+            raise RuntimeError("No se pudieron publicar todos los pasajes activos de la factura")
         try:
             es.delete_by_query(index=PASSAGES_INDEX, refresh=True,
                                query={"bool": {"filter": [{"term": {"invoice_id": job["id"]}},
