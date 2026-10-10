@@ -65,9 +65,6 @@ class PublicationIntegrationTests(unittest.TestCase):
 
                 es.delete_by_query(index=INDEX, query={"term": {"invoice_id": doc_id}}, refresh=True)
                 es.delete_by_query(index=PASSAGES_INDEX, query={"term": {"invoice_id": doc_id}}, refresh=True)
-                with closing(connect()) as db:
-                    db.execute("DELETE FROM generations WHERE job_id=?", (doc_id,))
-                    db.execute("DELETE FROM jobs WHERE id=?", (doc_id,))
         finally:
             jobstore._initialized.discard(jobstore.DATABASE_URL)
             with jobstore.psycopg.connect(jobstore.DATABASE_URL, autocommit=True) as admin:

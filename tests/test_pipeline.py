@@ -3,7 +3,7 @@ import tempfile
 import stat
 import unittest
 from io import BytesIO
-from contextlib import closing
+from contextlib import AsyncExitStack, closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -141,7 +141,8 @@ class PipelineTests(unittest.TestCase):
                 worker._ensure_current_attempt({"id": "fenced", "attempt_id": "old"})
 
     def test_startup_does_not_hide_elasticsearch_initialization_failure(self):
-        with patch.object(app, "initialize_index", side_effect=RuntimeError("mapping unavailable")), \
+        with patch.object(app.mcp.session_manager, "run", return_value=AsyncExitStack()), \
+             patch.object(app, "initialize_index", side_effect=RuntimeError("mapping unavailable")), \
              patch.object(app, "container_client") as container, \
              patch.object(app, "embedding_health", return_value=(False, False)):
             container.return_value.get_container_properties.return_value = None
@@ -296,46 +297,47 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(app.get_invoice_status(result["id"])["status"], "queued")
 
     def test_mcp_streamable_http_connects_lists_tools_and_calls_search_evidence_and_status(self):
-        headers = {**self.auth, "Accept": "application/json, text/event-stream"}
-        initialized = self.client.post("/mcp", headers=headers, json={
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2025-03-26", "capabilities": {},
-                       "clientInfo": {"name": "test", "version": "1"}},
-        })
-        self.assertEqual(initialized.status_code, 200, initialized.text)
-        self.assertIn("protocolVersion", initialized.json()["result"])
-        self.assertEqual(self.client.post("/mcp", headers={**headers,
-            "MCP-Protocol-Version": initialized.json()["result"]["protocolVersion"]}, json={
-                "jsonrpc": "2.0", "method": "notifications/initialized",
-            }).status_code, 202)
-        headers["MCP-Protocol-Version"] = initialized.json()["result"]["protocolVersion"]
-
-        def rpc(request_id, method, params=None):
-            response = self.client.post("/mcp", headers=headers, json={
-                "jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {},
+        with TestClient(app.app) as client:
+            headers = {**self.auth, "Accept": "application/json, text/event-stream"}
+            initialized = client.post("/mcp", headers=headers, json={
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                           "clientInfo": {"name": "test", "version": "1"}},
             })
-            self.assertEqual(response.status_code, 200, response.text)
-            return response.json()["result"]
+            self.assertEqual(initialized.status_code, 200, initialized.text)
+            self.assertIn("protocolVersion", initialized.json()["result"])
+            self.assertEqual(client.post("/mcp", headers={**headers,
+                "MCP-Protocol-Version": initialized.json()["result"]["protocolVersion"]}, json={
+                    "jsonrpc": "2.0", "method": "notifications/initialized",
+                }).status_code, 202)
+            headers["MCP-Protocol-Version"] = initialized.json()["result"]["protocolVersion"]
 
-        tools = rpc(2, "tools/list")["tools"]
-        names = {tool["name"] for tool in tools}
-        self.assertTrue({"semantic_search", "search_invoice_evidence", "get_invoice_status"} <= names)
+            def rpc(request_id, method, params=None):
+                response = client.post("/mcp", headers=headers, json={
+                    "jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {},
+                })
+                self.assertEqual(response.status_code, 200, response.text)
+                return response.json()["result"]
 
-        with patch.object(app, "run_search", return_value={"results": [{"invoice_id": "invoice-1"}]}) as search, \
-             patch.object(app, "run_invoice_evidence_search", return_value={"evidence": [{"invoice_id": "invoice-1", "content": "synthetic quote"}]}) as evidence:
-            self.assertIn("invoice-1", json.dumps(rpc(3, "tools/call", {
-                "name": "semantic_search", "arguments": {"query": "maintenance"},
-            })))
-            self.assertIn("synthetic quote", json.dumps(rpc(4, "tools/call", {
-                "name": "search_invoice_evidence", "arguments": {"query": "maintenance"},
-            })))
-        search.assert_called_once_with("maintenance", 10)
-        evidence.assert_called_once_with("maintenance", 5, None)
+            tools = rpc(2, "tools/list")["tools"]
+            names = {tool["name"] for tool in tools}
+            self.assertTrue({"semantic_search", "search_invoice_evidence", "get_invoice_status"} <= names)
 
-        status = rpc(5, "tools/call", {
-            "name": "get_invoice_status", "arguments": {"document_id": "missing-invoice"},
-        })
-        self.assertIn("Documento no encontrado", json.dumps(status))
+            with patch.object(app, "run_search", return_value={"results": [{"invoice_id": "invoice-1"}]}) as search, \
+                 patch.object(app, "run_invoice_evidence_search", return_value={"evidence": [{"invoice_id": "invoice-1", "content": "synthetic quote"}]}) as evidence:
+                self.assertIn("invoice-1", json.dumps(rpc(3, "tools/call", {
+                    "name": "semantic_search", "arguments": {"query": "maintenance"},
+                })))
+                self.assertIn("synthetic quote", json.dumps(rpc(4, "tools/call", {
+                    "name": "search_invoice_evidence", "arguments": {"query": "maintenance"},
+                })))
+            search.assert_called_once_with("maintenance", 10)
+            evidence.assert_called_once_with("maintenance", 5, None)
+
+            status = rpc(5, "tools/call", {
+                "name": "get_invoice_status", "arguments": {"document_id": "missing-invoice"},
+            })
+            self.assertIn("Documento no encontrado", json.dumps(status))
 
     def test_home_shows_upload_feedback(self):
         page = self.client.get("/").text

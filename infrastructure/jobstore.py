@@ -43,6 +43,7 @@ def connect(path: Path | None = None):
            sqlite3.connect(db_path, timeout=30))
     if not postgres:
         raw.row_factory = sqlite3.Row
+        raw.execute("PRAGMA foreign_keys=ON")
     db = Connection(raw, postgres)
     key = DATABASE_URL if postgres else str(db_path)
     if key not in _initialized:

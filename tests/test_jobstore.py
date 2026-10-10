@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
@@ -72,3 +73,25 @@ class QueueTests(unittest.TestCase):
                 db.commit()
             self.assertFalse(jobstore.heartbeat_job("expired", "old-attempt", db_path))
             self.assertFalse(jobstore.prepare_generation("expired", "old-attempt", "late-generation", 1, db_path))
+
+    def test_sqlite_foreign_keys_are_enabled_on_every_connection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "jobs.sqlite3"
+            with jobstore.connect(db_path) as db:
+                self.assertEqual(db.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db.execute("""INSERT INTO extraction_runs
+                        (id,document_id,extractor_version,status,warnings_json)
+                        VALUES('orphan','missing','test-v1','succeeded','[]')""")
+
+            with jobstore.connect(db_path) as db:
+                self.assertEqual(db.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+                db.execute("INSERT INTO jobs(id) VALUES('document')")
+                db.execute("""INSERT INTO extraction_runs
+                    (id,document_id,extractor_version,status,warnings_json)
+                    VALUES('run','document','test-v1','succeeded','[]')""")
+                db.execute("INSERT INTO extraction_pages(run_id,page_number,structure_json) VALUES('run',1,'{}')")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db.execute("""INSERT INTO extraction_evidence
+                        (id,run_id,field_name,page_number,quote)
+                        VALUES('evidence','run','missing-field',1,'quote')""")
