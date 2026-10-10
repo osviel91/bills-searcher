@@ -62,6 +62,15 @@ Pruebas deterministas (sin enviar datos al proveedor):
 docker compose run --rm --no-deps app python -m unittest discover -s tests -v
 ```
 
+La evaluación offline de extracción estructurada usa exclusivamente PDFs sintéticos/anonimizados y no llama servicios externos:
+
+```sh
+docker compose run --rm --no-deps -v "$PWD:/app" app \
+  python -m scripts.evaluate_extraction evaluation/structured-extraction-v1.json
+```
+
+Escribe `extraction-report.json` y `extraction-report.md` en el directorio actual. Formato del dataset v1 y opciones de salida: `evaluation/README.md`.
+
 Prueba real de humo contra el servicio local y oMLX (envía solo las consultas de ejemplo): `python3 scripts/smoke_search.py`.
 
 Para medir calidad sobre las facturas ya indexadas, crea un JSON con consultas y nombres de archivo que el usuario haya etiquetado como relevantes:

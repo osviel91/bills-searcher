@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "description": "Synthetic-only reference dataset for structured invoice extraction.",
+  "cases": [
+    {
+      "case_id": "synthetic-basic-001",
+      "pdf": "fixtures/synthetic-basic-001.pdf",
+      "template": null,
+      "expected_fields": {
+        "invoice_number": "F-1001",
+        "issue_date": "2026-09-03",
+        "issuer_id": null,
+        "customer_id": null,
+        "issuer_tax_id": null,
+        "customer_tax_id": null,
+        "currency": "EUR",
+        "tax_base": "10.00",
+        "vat": "2.10",
+        "total": "12.10"
+      },
+      "intentionally_absent": ["issuer_id", "customer_id", "issuer_tax_id", "customer_tax_id"],
+      "expected_lines": [
+        {
+          "description": "Consulting",
+          "values": {"quantity": "1", "unit_price": "10.00", "amount": "10.00"},
+          "evidence": [{"page": 1, "quote": "Consulting | 1 | 10,00 | 10,00"}]
+        }
+      ],
+      "evidence": {
+        "invoice_number": [{"page": 1, "quote": "Factura: F-1001"}],
+        "issue_date": [{"page": 1, "quote": "03/09/2026"}],
+        "currency": [{"page": 1, "quote": "EUR"}],
+        "tax_base": [{"page": 1, "quote": "Base imponible: 10,00"}],
+        "vat": [{"page": 1, "quote": "IVA 21%: 2,10"}],
+        "total": [{"page": 1, "quote": "Total: 12,10"}]
+      }
+    }
+  ]
+}

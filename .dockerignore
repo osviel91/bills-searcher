@@ -3,7 +3,9 @@
 .venv/
 __pycache__/
 *.pyc
-scripts/
+scripts/*
+!scripts/evaluate_extraction.py
+!scripts/extraction_evaluation.py
 garage.toml
 evidence-evaluation.json
 .evidence-evaluation-*.tmp
