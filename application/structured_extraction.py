@@ -1,13 +1,11 @@
 import uuid
 
+from application.extractor_registry import GENERIC, select_extractor
 from domain.structured_extraction import ExtractionExecution
 from infrastructure.extraction_store import save_execution
 from infrastructure.jobstore import connect
 from infrastructure.object_store import get as get_object
 from infrastructure.pdf_extraction import extract_pdf
-
-EXTRACTOR_VERSION = "pdf-structure-v1"
-
 
 def extract_document(document_id: str, *, db_path=None) -> str:
     with connect(db_path) as db:
@@ -21,18 +19,23 @@ def extract_document(document_id: str, *, db_path=None) -> str:
             raise ValueError("El documento no tiene un original almacenado")
         data = get_object(document["object_key"]).readall()
         pages = extract_pdf(data)
+        extractor, warnings = select_extractor(pages)
+        fields, lines, extraction_warnings = extractor.extract(pages)
         execution = ExtractionExecution(
             id=execution_id,
             document_id=document_id,
-            extractor_version=EXTRACTOR_VERSION,
+            extractor_version=f"{extractor.id}@{extractor.version}",
             status="succeeded",
             pages=pages,
+            fields=fields,
+            lines=lines,
+            warnings=warnings + extraction_warnings,
         )
     except Exception as error:
         execution = ExtractionExecution(
             id=execution_id,
             document_id=document_id,
-            extractor_version=EXTRACTOR_VERSION,
+            extractor_version=f"{GENERIC.id}@{GENERIC.version}",
             status="failed",
             error=type(error).__name__,
         )

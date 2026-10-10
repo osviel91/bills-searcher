@@ -1,0 +1,28 @@
+from dataclasses import dataclass
+
+from domain.invoice_extraction import GENERIC_EXTRACTOR_ID, GENERIC_EXTRACTOR_VERSION, extract_invoice
+
+
+@dataclass(frozen=True)
+class Extractor:
+    id: str
+    version: str
+    priority: int
+    detector: object
+    extract: object
+
+
+GENERIC = Extractor(GENERIC_EXTRACTOR_ID, GENERIC_EXTRACTOR_VERSION, 0, lambda pages: True, extract_invoice)
+EXTRACTORS = (GENERIC,)
+
+
+def select_extractor(pages, extractors=EXTRACTORS):
+    matched = [item for item in extractors if item.detector(pages)]
+    if not matched:
+        return GENERIC, ("No extractor matched; generic fallback selected",)
+    priority = max(item.priority for item in matched)
+    winners = [item for item in matched if item.priority == priority]
+    if len(winners) != 1:
+        return GENERIC, ("Ambiguous extractors at priority " + str(priority) + ": " +
+                         ", ".join(sorted(item.id for item in winners)) + "; generic fallback selected",)
+    return winners[0], ()

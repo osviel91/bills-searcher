@@ -20,6 +20,12 @@ def _bounds(bounds: BoundingBox | None):
 
 
 def save_execution(execution: ExtractionExecution, path=None):
+    for item in execution.fields:
+        if item.name in {"tax_base", "vat", "total", "invoice_total", "total_payable"} and item.value is not None and not item.evidence:
+            raise ValueError(f"Monetary field {item.name} requires document evidence")
+    for item in execution.lines:
+        if any(key in item.values for key in ("amount", "unit_price", "price")) and not item.evidence:
+            raise ValueError("Monetary line values require document evidence")
     with connect(path) as db:
         db.execute("""INSERT INTO extraction_runs
             (id,document_id,extractor_version,status,warnings_json,error)
