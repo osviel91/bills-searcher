@@ -8,12 +8,14 @@ from unittest.mock import patch
 
 import jobstore
 from application.structured_extraction import extract_document
+from application.extractor_registry import Extractor, select_extractor
 from domain.structured_extraction import (
     Evidence,
     ExtractedField,
     ExtractionExecution,
     ProposedLine,
 )
+from domain.invoice_extraction import extract_invoice
 from infrastructure.extraction_store import save_execution
 from infrastructure.pdf_extraction import extract_pdf
 
@@ -124,6 +126,70 @@ class StructuredExtractionTests(unittest.TestCase):
             document = db.execute("SELECT status FROM jobs WHERE id='invoice-1'").fetchone()
         self.assertEqual(run["status"], "failed")
         self.assertEqual(document["status"], "indexed")
+
+    def test_generic_extractor_extracts_only_evidenced_values(self):
+        pdf = synthetic_pdf([["Factura: F-2026/14", "Fecha: 3/9/2026",
+                              "Emisor CIF: B12345678", "Cliente CIF: A1234567B",
+                              "Moneda EUR", "Descripcion  Cantidad  Precio  Importe",
+                              "Servicio mensual", "Licencia    2    10,00    20,00",
+                              "Descuento -5,00", "Base imponible: 15,00", "IVA 21%: 3,15",
+                              "Total: 18,15"]])
+        with patch("application.structured_extraction.get_object",
+                   return_value=type("Blob", (), {"readall": lambda self: pdf})()):
+            run_id = extract_document("invoice-1", db_path=self.db_path)
+        with closing(jobstore.connect(self.db_path)) as db:
+            run = db.execute("SELECT extractor_version,warnings_json FROM extraction_runs WHERE id=?", (run_id,)).fetchone()
+            fields = {row["name"]: json.loads(row["value_json"]) for row in db.execute(
+                "SELECT name,value_json FROM extraction_fields WHERE run_id=?", (run_id,))}
+            evidence = list(db.execute("SELECT field_name,quote,page_number,bounds_json FROM extraction_evidence WHERE run_id=?", (run_id,)))
+            lines = list(db.execute("SELECT description,values_json FROM extraction_lines WHERE run_id=?", (run_id,)))
+        self.assertEqual(run["extractor_version"], "generic-invoice@1")
+        self.assertEqual(fields["invoice_number"], "F-2026/14")
+        self.assertEqual(fields["issue_date"], "2026-09-03")
+        self.assertEqual(fields["tax_base"], "15.00")
+        self.assertEqual(fields["vat"], "3.15")
+        self.assertEqual(fields["total"], "18.15")
+        self.assertIsNone(fields["customer_id"])
+        self.assertTrue(lines)
+        self.assertTrue(all(row["page_number"] == 1 and row["quote"] for row in evidence))
+        self.assertTrue(all(row["bounds_json"] for row in evidence))
+
+    def test_extractor_selection_reports_equal_priority_conflict(self):
+        page = extract_pdf(synthetic_pdf([["Factura: F-12345"]]))
+        first = Extractor("template-a", "1", 10, lambda _: True, lambda _: ((), (), ()))
+        second = Extractor("template-b", "1", 10, lambda _: True, lambda _: ((), (), ()))
+        selected, warnings = select_extractor(page, (first, second))
+        self.assertEqual(selected.id, "generic-invoice")
+        self.assertIn("template-a, template-b", warnings[0])
+
+    def test_synthetic_date_formats_absent_fields_and_ambiguous_labels(self):
+        for raw_date, expected in (("03/09/2026", "2026-09-03"), ("3-9-2026", "2026-09-03"),
+                                   ("2026-09-03", "2026-09-03"), ("03.09.2026", "2026-09-03")):
+            pages = extract_pdf(synthetic_pdf([[f"Fecha: {raw_date}", "Factura: Total 20,00"]]))
+            fields, _, _ = extract_invoice(pages)
+            values = {field.name: field.value for field in fields}
+            self.assertEqual(values["issue_date"].isoformat(), expected)
+            self.assertIsNone(values["invoice_number"])
+            self.assertIsNone(values["tax_base"])
+
+    def test_multiple_lines_and_multiline_description_keep_source_evidence(self):
+        pages = extract_pdf(synthetic_pdf([[
+            "Descripcion | Cantidad | Precio | Importe", "Servicio mensual", "soporte remoto",
+            "Plan A | 2 | 10,00 | 20,00", "Plan B | 1 | 7,50 | 7,50", "Total: 27,50",
+        ]]))
+        _, lines, _ = extract_invoice(pages)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0].description, "Servicio mensual soporte remoto Plan A")
+        self.assertEqual(lines[0].values["amount"], Decimal("20.00"))
+        self.assertEqual(lines[1].values["amount"], Decimal("7.50"))
+        self.assertTrue(all(line.evidence for line in lines))
+
+    def test_monetary_values_cannot_be_persisted_without_evidence(self):
+        with self.assertRaisesRegex(ValueError, "requires document evidence"):
+            save_execution(ExtractionExecution(
+                id="no-evidence", document_id="invoice-1", extractor_version="test-v1",
+                status="succeeded", fields=(ExtractedField("total", Decimal("4.00")),),
+            ), self.db_path)
 
 
 if __name__ == "__main__":
