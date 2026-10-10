@@ -4,3 +4,5 @@
 __pycache__/
 *.pyc
 garage.toml
+evidence-evaluation.json
+.evidence-evaluation-*.tmp
