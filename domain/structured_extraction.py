@@ -20,6 +20,15 @@ class TextBlock:
 
 
 @dataclass(frozen=True)
+class PDFToken:
+    id: str
+    text: str
+    bounds: BoundingBox
+    character_ids: tuple[str, ...]
+    character_bounds: tuple[BoundingBox, ...]
+
+
+@dataclass(frozen=True)
 class TableRegion:
     id: str
     bounds: BoundingBox
@@ -42,9 +51,19 @@ class Evidence:
     quote: str
     bounds: BoundingBox | None = None
     block_id: str | None = None
+    label_quote: str | None = None
+    label_bounds: BoundingBox | None = None
+    method: str | None = None
+    extractor_id: str | None = None
+    extractor_version: str | None = None
+    source_token_ids: tuple[str, ...] = ()
 
 
-FieldValue = str | Decimal | date | int | bool | None
+FieldValue = str | Decimal | date | int | bool | tuple[Decimal, ...] | None
+ExtractionState = Literal[
+    "confirmed", "absent", "ambiguous", "not_applicable", "unreadable",
+    "conflict", "insufficient_evidence", "unverified_semantics",
+]
 
 
 @dataclass(frozen=True)
@@ -53,6 +72,8 @@ class ExtractedField:
     value: FieldValue = None
     evidence: tuple[Evidence, ...] = ()
     warnings: tuple[str, ...] = ()
+    status: ExtractionState | None = None
+    candidates: tuple[FieldValue, ...] = ()
 
 
 @dataclass(frozen=True)

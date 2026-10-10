@@ -38,6 +38,39 @@ TEMPLATE_DETECTORS = (
 )
 
 
+def _template_matches(template):
+    def detector(pages):
+        from application.template_detection import detect_template
+        return detect_template(pages).template == template
+    return detector
+
+
+def _extract_t01(pages, tokens):
+    from application.template_extraction import extract_t01_header_summary
+    fields, warnings = extract_t01_header_summary(pages, tokens)
+    return fields, (), warnings
+
+
+def _extract_t02(pages, tokens):
+    from application.template_extraction import extract_t02_header_summary
+    fields, warnings = extract_t02_header_summary(pages, tokens)
+    return fields, (), warnings
+
+
+# Offline-only records; deliberately excluded from the active EXTRACTORS tuple.
+TEMPLATE_EXTRACTORS = (
+    Extractor("as400-t01-header-summary", "1", 1, _template_matches("T01"), _extract_t01),
+    Extractor("as400-t02-header-summary", "1", 1, _template_matches("T02"), _extract_t02),
+)
+
+
+def template_extractor_for(template):
+    for extractor in TEMPLATE_EXTRACTORS:
+        if extractor.id == f"as400-{template.lower()}-header-summary":
+            return extractor
+    raise ValueError(f"No offline template extractor for {template}")
+
+
 def select_extractor(pages, extractors=EXTRACTORS):
     matched = [item for item in extractors if item.detector(pages)]
     if not matched:
