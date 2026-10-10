@@ -30,7 +30,9 @@ Swagger UI está disponible en `/api/docs`, la especificación OpenAPI en `/api/
 
 La API REST acepta PDFs e imágenes compatibles como `multipart/form-data` en `POST /api/documents`, usando el campo repetido `files`. Las imágenes se validan como PNG/JPEG/WEBP y requieren Jina en modo directo. Devuelve identificadores para consultar individualmente `GET /api/documents/{id}`. El listado admite `limit` (1-200), `offset` y filtro `status`. La búsqueda de facturas es `POST /api/search`; la recuperación de pasajes de evidencia es `POST /api/search/evidence` con `{query, limit, invoice_id?}`, y los filtros estructurados se envían a `POST /api/invoices/filter` como JSON con campos de factura, cliente, fechas e intervalo de total a pagar.
 
-La interfaz web permite alternar entre facturas, pasajes de evidencia y filtros estructurados. Los pasajes muestran offsets sobre texto extraído (no páginas del PDF), score relativo y acceso al original. Los resultados filtrados incluyen la confianza heurística y la evidencia textual disponibles; estos campos no constituyen verificación contable. La interfaz presenta evidencia, pero no genera respuestas: esa responsabilidad corresponde al agente que consume MCP.
+La interfaz web permite alternar entre facturas, pasajes de evidencia, filtros estructurados y evaluación. Los pasajes muestran offsets sobre texto extraído (no páginas del PDF), score relativo y acceso al original. Los resultados filtrados incluyen la confianza heurística y la evidencia textual disponibles; estos campos no constituyen verificación contable. La interfaz presenta evidencia, pero no genera respuestas: esa responsabilidad corresponde al agente que consume MCP.
+
+La pestaña **Evaluación** guarda los casos etiquetados en `DATA_DIR/evidence-evaluation.json`, permite inspeccionar el texto extraído y añadir citas revisadas manualmente, y ejecuta Recall@5/10 en el backend. Informa por separado (1) resolución de factura en la búsqueda de documentos, (2) recuperación global de pasajes y (3) recuperación de pasajes condicionada por los `invoice_id` gold. La tercera métrica es diagnóstica/oráculo: mide recuperación dentro de la factura una vez conocida, no Recall end-to-end. Los contratos REST son `GET/PUT /api/evaluation/evidence/cases`, `POST /api/evaluation/evidence/run` y `GET /api/documents/{id}/text`. El archivo contiene consultas e incluso citas de facturas: queda en el volumen local `DATA_DIR`, protegido por Bearer en la API; protege también los permisos y las copias de seguridad del volumen. La UI no marca resultados recuperados como relevantes automáticamente.
 
 El servidor MCP usa Streamable HTTP en `/mcp` y publica `index_invoice` (un PDF por llamada, codificado en base64), `get_invoice_status`, `reindex_invoices`, `semantic_search`, `search_invoice_evidence` y `filter_invoices`. Para archivos grandes, usa el endpoint REST multipart: el transporte MCP tiene un límite de tamaño de mensaje del SDK, por lo que no debe usarse para PDFs grandes.
 
@@ -74,6 +76,18 @@ Para medir calidad sobre las facturas ya indexadas, crea un JSON con consultas y
 Los filenames anteriores son marcadores de posición, no resultados esperados.
 
 Después, con la aplicación activa, ejecuta `python3 scripts/evaluate_search.py casos.json`. Informa Recall@5/10, latencia, top 10 y puede exigir `expected_top1`. Hay un caso de regresión etiquetado; añade más juicios humanos para medir generalización, no interpretes un único caso como evaluación representativa.
+
+Para evaluar evidencia, etiqueta citas textuales relevantes por `invoice_id` estable y fragmento esperado, no por `passage_id` (cambia con cada generación):
+
+```json
+[
+  {"query": "mantenimiento de impresoras", "relevant_evidence": [
+    {"invoice_id": "ID-de-factura-etiquetada", "quote": "fragmento exacto que respalda la consulta"}
+  ]}
+]
+```
+
+Con `API_TOKEN` disponible en el entorno y la app activa, ejecuta `python3 scripts/evaluate_evidence.py evidencia.json`. El script consulta `/api/search/evidence` y calcula Recall@5/10 sobre citas: un resultado cuenta cuando pertenece a la factura etiquetada y contiene el fragmento esperado (sin distinguir mayúsculas ni espacios). Informa latencia y metadatos del top 10, pero no imprime el contenido de los pasajes. Las etiquetas deben ser juicios humanos; el ejemplo es un marcador, no un resultado esperado.
 
 ## Modos y límites
 
