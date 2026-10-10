@@ -70,6 +70,12 @@ class Phase0CIntegrationTests(unittest.TestCase):
         self._clear_hook()
         for doc_id in self.doc_ids:
             with closing(connect()) as db:
+                db.execute("DELETE FROM extraction_evidence WHERE run_id IN "
+                           "(SELECT id FROM extraction_runs WHERE document_id=?)", (doc_id,))
+                for table in ("extraction_fields", "extraction_lines", "extraction_pages"):
+                    db.execute(f"DELETE FROM {table} WHERE run_id IN "
+                               "(SELECT id FROM extraction_runs WHERE document_id=?)", (doc_id,))
+                db.execute("DELETE FROM extraction_runs WHERE document_id=?", (doc_id,))
                 row = db.execute("SELECT object_key FROM jobs WHERE id=?", (doc_id,)).fetchone()
                 db.execute("DELETE FROM generations WHERE job_id=?", (doc_id,))
                 db.execute("DELETE FROM jobs WHERE id=?", (doc_id,))
