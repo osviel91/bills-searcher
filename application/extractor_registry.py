@@ -16,6 +16,28 @@ GENERIC = Extractor(GENERIC_EXTRACTOR_ID, GENERIC_EXTRACTOR_VERSION, 0, lambda p
 EXTRACTORS = (GENERIC,)
 
 
+@dataclass(frozen=True)
+class TemplateDetector:
+    id: str
+    version: str
+    headers: tuple[str, ...]
+    labels: tuple[str, ...]
+    geometry: str
+
+
+TEMPLATE_DETECTORS = (
+    TemplateDetector(
+        "as400-t01", "1", ("CONCEPTO", "ALBARAN", "FECHA", "T.CHEQUES", "TOTAL"),
+        ("COMISION", "FORFAIT GESTION", "GASTOS ENVIO", "TOTAL EUROS"), "split-detail-band",
+    ),
+    TemplateDetector(
+        "as400-t02", "1",
+        ("DESCRIPCION", "CANTIDAD", "IMP. UNIDAD", "IMPORTE", "TIPO IVA", "CUOTA IVA", "TOTAL"),
+        ("BASE IMPONIBLE", "CUOTA IVA", "TOTAL FACTURA", "TOTAL A PAGAR"), "single-detail-band",
+    ),
+)
+
+
 def select_extractor(pages, extractors=EXTRACTORS):
     matched = [item for item in extractors if item.detector(pages)]
     if not matched:

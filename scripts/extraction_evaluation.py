@@ -9,6 +9,7 @@ from pathlib import Path
 
 from domain.invoice_extraction import extract_invoice
 from infrastructure.pdf_extraction import extract_pdf
+from scripts.template_evaluation import evaluate_templates, markdown_template_report
 
 
 def normalize(field, value):
@@ -133,7 +134,9 @@ def compare_case(case, predicted_fields, predicted_lines):
     }
 
 
-def evaluate(dataset_path):
+def evaluate(dataset_path, template_manifest=None, template_pdf_root=None):
+    if (template_manifest is None) != (template_pdf_root is None):
+        raise ValueError("Template evaluation requires both a private manifest and a PDF root")
     path = Path(dataset_path)
     dataset = json.loads(path.read_text())
     if dataset.get("version") != 1:
@@ -176,6 +179,8 @@ def evaluate(dataset_path):
                           "fields": aggregate_fields,
                           "line_precision": sum(row["line_precision"] for row in results) / len(results) if results else 1.0,
                           "line_recall": sum(row["line_recall"] for row in results) / len(results) if results else 1.0}}
+    if template_manifest is not None:
+        report["template_classification"] = evaluate_templates(template_manifest, template_pdf_root)
     return report
 
 
@@ -196,4 +201,6 @@ def markdown_report(report):
         lines.append(f"- `{case['case_id']}`: {errors}")
     unresolved = [case["case_id"] for case in report["cases"] if case["insufficient_evidence"]]
     lines.extend(["", "## Cases with insufficient reference evidence", "", ", ".join(f"`{case}`" for case in unresolved) or "none", ""])
+    if "template_classification" in report:
+        lines.extend(["", markdown_template_report(report["template_classification"])])
     return "\n".join(lines)
