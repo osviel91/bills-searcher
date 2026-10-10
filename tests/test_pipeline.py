@@ -404,7 +404,9 @@ class PipelineTests(unittest.TestCase):
             blank_markdown = Mock(convert_local=Mock(return_value=SimpleNamespace(markdown="  ")))
             with patch.object(ingestion, "client", return_value=worker_es), patch.object(ingestion, "settings", return_value={"provider": "openai-compatible", "document_mode": "text", "model": "test-model"}), patch.object(ingestion, "embed", return_value=[0.5] * 1024) as embed_mock, patch.object(ingestion, "embed_many", return_value=[[0.5] * 1024]) as embed_many_mock, patch.object(ingestion, "get_object", return_value=SimpleNamespace(readall=lambda: b"pdf")):
                 with patch.object(ingestion, "MarkItDown", return_value=good_markdown):
-                    worker.process(good_job)
+                    with patch("application.structured_extraction.extract_document",
+                               side_effect=RuntimeError("structured store unavailable")):
+                        worker.process(good_job)
                 with patch.object(ingestion, "MarkItDown", return_value=blank_markdown):
                     worker.process(blank_job)
 

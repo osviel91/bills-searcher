@@ -1,4 +1,5 @@
 import mimetypes
+import logging
 import os
 import tempfile
 import threading
@@ -130,6 +131,12 @@ def process(job, stage_hook=None, *, db_path=None):
         else:
             db.execute("UPDATE jobs SET status=?,error=?,locked_at=NULL WHERE id=?", (status, error, job["id"]))
         db.commit()
+    if status == "indexed" and content_type == "application/pdf":
+        try:
+            from application.structured_extraction import extract_document
+            extract_document(job["id"], db_path=db_path)
+        except Exception:
+            logging.exception("Structured extraction failed for document %s", job["id"])
 
 
 def _heartbeat_until_stopped(job_id, attempt_id, stop, db_path=None):

@@ -67,6 +67,29 @@ def connect(path: Path | None = None):
             published_at TIMESTAMP, passage_count INTEGER NOT NULL DEFAULT 0)""")
         db.execute("CREATE INDEX IF NOT EXISTS generations_job_status ON generations(job_id,status)")
         db.execute("CREATE TABLE IF NOT EXISTS maintenance_metrics (name TEXT PRIMARY KEY,value INTEGER NOT NULL DEFAULT 0)")
+        db.execute("""CREATE TABLE IF NOT EXISTS extraction_runs (
+            id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES jobs(id),
+            extractor_version TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('succeeded','failed')),
+            warnings_json TEXT NOT NULL, error TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        db.execute("CREATE INDEX IF NOT EXISTS extraction_runs_document ON extraction_runs(document_id,created_at)")
+        db.execute("""CREATE TABLE IF NOT EXISTS extraction_pages (
+            run_id TEXT NOT NULL REFERENCES extraction_runs(id), page_number INTEGER NOT NULL,
+            structure_json TEXT NOT NULL, PRIMARY KEY(run_id,page_number))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS extraction_fields (
+            run_id TEXT NOT NULL REFERENCES extraction_runs(id), name TEXT NOT NULL,
+            value_json TEXT, warnings_json TEXT NOT NULL, PRIMARY KEY(run_id,name))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS extraction_lines (
+            run_id TEXT NOT NULL REFERENCES extraction_runs(id), line_number INTEGER NOT NULL,
+            description TEXT, values_json TEXT NOT NULL, warnings_json TEXT NOT NULL,
+            PRIMARY KEY(run_id,line_number))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS extraction_evidence (
+            id TEXT PRIMARY KEY, run_id TEXT NOT NULL, field_name TEXT, line_number INTEGER,
+            page_number INTEGER NOT NULL, block_id TEXT, quote TEXT NOT NULL, bounds_json TEXT,
+            CHECK((field_name IS NOT NULL AND line_number IS NULL) OR
+                  (field_name IS NULL AND line_number IS NOT NULL)),
+            FOREIGN KEY(run_id,field_name) REFERENCES extraction_fields(run_id,name),
+            FOREIGN KEY(run_id,line_number) REFERENCES extraction_lines(run_id,line_number),
+            FOREIGN KEY(run_id,page_number) REFERENCES extraction_pages(run_id,page_number))""")
         db.commit()
         _initialized.add(key)
     return db
