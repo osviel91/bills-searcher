@@ -103,6 +103,7 @@ def connect(path: Path | None = None):
                     "detector_version TEXT", "template TEXT", "extractor_id TEXT",
                     "extractor_set_fingerprint TEXT", "execution_mode TEXT", "result_schema_version INTEGER",
                     "idempotency_key TEXT", "abstention_reason TEXT", "diagnostics_code TEXT",
+                    "result_fingerprint TEXT", "result_fingerprint_version INTEGER NOT NULL DEFAULT 1",
                     "finished_at TIMESTAMP", "execution_slot TEXT", "document_size_bytes INTEGER"),
                 "extraction_fields": ("observation_status TEXT", "candidates_json TEXT"),
                 "extraction_evidence": ("label_quote TEXT", "label_bounds_json TEXT", "method TEXT",
