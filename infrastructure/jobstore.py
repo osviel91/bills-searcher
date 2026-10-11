@@ -5,6 +5,7 @@ from pathlib import Path
 
 import psycopg
 from psycopg.rows import dict_row
+from infrastructure.migrations import apply as apply_migrations
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 LEASE_SECONDS = max(1, int(os.getenv("JOB_LEASE_SECONDS", "3600")))
@@ -19,7 +20,9 @@ class Connection:
         self.postgres = postgres
 
     def execute(self, query, params=()):
-        return self.raw.execute(query.replace("?", "%s") if self.postgres else query, params)
+        if self.postgres and isinstance(query, str):
+            query = query.replace("?", "%s")
+        return self.raw.execute(query, params)
 
     def __enter__(self):
         return self
@@ -46,7 +49,10 @@ def connect(path: Path | None = None):
         raw.execute("PRAGMA foreign_keys=ON")
     db = Connection(raw, postgres)
     key = DATABASE_URL if postgres else str(db_path)
-    if key not in _initialized:
+    initialize_postgres = os.getenv("SCHEMA_INITIALIZER") == "true"
+    if key not in _initialized and (not postgres or initialize_postgres):
+        if postgres:
+            db.execute("SELECT pg_advisory_xact_lock(?)", (726412880,))
         db.execute("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, sha256 TEXT UNIQUE, filename TEXT, object_key TEXT, status TEXT, error TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, locked_at TIMESTAMP)")
         if postgres:
             db.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempt_id TEXT")
@@ -70,7 +76,7 @@ def connect(path: Path | None = None):
         db.execute("CREATE TABLE IF NOT EXISTS maintenance_metrics (name TEXT PRIMARY KEY,value INTEGER NOT NULL DEFAULT 0)")
         db.execute("""CREATE TABLE IF NOT EXISTS extraction_runs (
             id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES jobs(id),
-            extractor_version TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('succeeded','failed')),
+            extractor_version TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','discarded_fenced')),
             warnings_json TEXT NOT NULL, error TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         db.execute("CREATE INDEX IF NOT EXISTS extraction_runs_document ON extraction_runs(document_id,created_at)")
         db.execute("""CREATE TABLE IF NOT EXISTS extraction_pages (
@@ -87,11 +93,34 @@ def connect(path: Path | None = None):
             id TEXT PRIMARY KEY, run_id TEXT NOT NULL, field_name TEXT, line_number INTEGER,
             page_number INTEGER NOT NULL, block_id TEXT, quote TEXT NOT NULL, bounds_json TEXT,
             CHECK((field_name IS NOT NULL AND line_number IS NULL) OR
-                  (field_name IS NULL AND line_number IS NOT NULL)),
+                   (field_name IS NULL AND line_number IS NOT NULL)),
             FOREIGN KEY(run_id,field_name) REFERENCES extraction_fields(run_id,name),
             FOREIGN KEY(run_id,line_number) REFERENCES extraction_lines(run_id,line_number),
             FOREIGN KEY(run_id,page_number) REFERENCES extraction_pages(run_id,page_number))""")
+        if not postgres:
+            for table, columns in {
+                "extraction_runs": ("document_sha256 TEXT", "attempt_id TEXT", "detector_id TEXT",
+                    "detector_version TEXT", "template TEXT", "extractor_id TEXT",
+                    "extractor_set_fingerprint TEXT", "execution_mode TEXT", "result_schema_version INTEGER",
+                    "idempotency_key TEXT", "abstention_reason TEXT", "diagnostics_code TEXT",
+                    "finished_at TIMESTAMP", "execution_slot TEXT", "document_size_bytes INTEGER"),
+                "extraction_fields": ("observation_status TEXT", "candidates_json TEXT"),
+                "extraction_evidence": ("label_quote TEXT", "label_bounds_json TEXT", "method TEXT",
+                    "extractor_id TEXT", "extractor_version TEXT", "source_token_ids_json TEXT"),
+            }.items():
+                existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+                for definition in columns:
+                    if definition.split()[0] not in existing:
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS extraction_runs_document_idempotency "
+                       "ON extraction_runs(document_id,idempotency_key) WHERE idempotency_key IS NOT NULL")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS extraction_runs_document_attempt_slot "
+                       "ON extraction_runs(document_id,attempt_id,execution_slot) "
+                       "WHERE attempt_id IS NOT NULL AND execution_slot IS NOT NULL")
         db.commit()
+        if postgres:
+            apply_migrations(db)
+            db.commit()
         _initialized.add(key)
     return db
 

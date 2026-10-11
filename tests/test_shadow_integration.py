@@ -9,6 +9,8 @@ from contextlib import closing
 from pathlib import Path
 
 import httpx
+import psycopg
+from psycopg.rows import dict_row
 
 from application.template_detection import detect_template
 from infrastructure.jobstore import claim_next_job, connect
@@ -49,17 +51,17 @@ class ShadowIntegrationTests(unittest.TestCase):
         (HOOK_DIR / "pause-claiming").touch()
         (HOOK_DIR / "shadow-child-release").touch()
         for doc_id in self.doc_ids:
-            with closing(connect()) as db:
-                db.execute("DELETE FROM extraction_evidence WHERE run_id IN "
-                           "(SELECT id FROM extraction_runs WHERE document_id=?)", (doc_id,))
-                for table in ("extraction_fields", "extraction_lines", "extraction_pages"):
-                    db.execute(f"DELETE FROM {table} WHERE run_id IN "
-                               "(SELECT id FROM extraction_runs WHERE document_id=?)", (doc_id,))
-                db.execute("DELETE FROM extraction_runs WHERE document_id=?", (doc_id,))
-                row = db.execute("SELECT object_key FROM jobs WHERE id=?", (doc_id,)).fetchone()
-                db.execute("DELETE FROM generations WHERE job_id=?", (doc_id,))
-                db.execute("DELETE FROM jobs WHERE id=?", (doc_id,))
-                db.commit()
+            with psycopg.connect(os.environ["DATABASE_ADMIN_URL"], row_factory=dict_row) as db:
+                with db.transaction():
+                    db.execute("SET LOCAL ROLE extraction_retention_operator")
+                    run_ids = [row["id"] for row in db.execute(
+                        "SELECT id FROM extraction_runs WHERE document_id=%s", (doc_id,))]
+                    for run_id in run_ids:
+                        db.execute("SELECT retire_extraction_run(%s)", (run_id,))
+                    db.execute("RESET ROLE")
+                row = db.execute("SELECT object_key FROM jobs WHERE id=%s", (doc_id,)).fetchone()
+                db.execute("DELETE FROM generations WHERE job_id=%s", (doc_id,))
+                db.execute("DELETE FROM jobs WHERE id=%s", (doc_id,))
             if row and row["object_key"]:
                 delete_object(row["object_key"])
             self.es.delete_by_query(index=INDEX, query={"term": {"invoice_id": doc_id}}, refresh=True)

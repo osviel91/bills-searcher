@@ -2,10 +2,17 @@ services:
   postgres:
     env_file: !reset []
     environment:
-      POSTGRES_USER: integration
-      POSTGRES_PASSWORD: integration-only
+      POSTGRES_USER: integration_admin
+      POSTGRES_PASSWORD: integration-admin-only
       POSTGRES_DB: bills_integration
     ports: !reset []
+
+  schema-migrate:
+    env_file: !reset []
+    environment:
+      DATABASE_MIGRATION_URL: postgresql://integration_admin:integration-admin-only@postgres:5432/bills_integration
+      APP_DB_USER: integration_app
+      APP_DB_PASSWORD: integration-app-only
 
   elasticsearch:
     environment:
@@ -24,7 +31,7 @@ services:
   app:
     env_file: !reset []
     environment: &integration-env
-      DATABASE_URL: postgresql://integration:integration-only@postgres:5432/bills_integration
+      DATABASE_URL: postgresql://integration_app:integration-app-only@postgres:5432/bills_integration
       ELASTICSEARCH_URL: http://elasticsearch:9200
       ELASTICSEARCH_INDEX: bills-phase0c
       EMBEDDING_BASE_URL: http://embedding-stub:8081/v1
@@ -74,6 +81,9 @@ services:
     command: sh -c 'touch /integration-hooks/pause-claiming && touch /integration-hooks/workers-start && python -m unittest discover -s tests -p "$${INTEGRATION_TEST_PATTERN}" -v'
     environment:
       <<: *integration-env
+      DATABASE_ADMIN_URL: postgresql://integration_admin:integration-admin-only@postgres:5432/bills_integration
+      APP_DB_USER: integration_app
+      APP_DB_PASSWORD: integration-app-only
       APP_URL: http://app:8000
       PHASE0C_HOOK_DIR: /integration-hooks
     env_file: !reset []

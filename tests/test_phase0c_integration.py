@@ -11,6 +11,7 @@ from pathlib import Path
 
 import httpx
 import psycopg
+from psycopg.rows import dict_row
 from fastapi import HTTPException
 from unittest.mock import patch
 
@@ -69,17 +70,17 @@ class Phase0CIntegrationTests(unittest.TestCase):
         (HOOK_DIR / "pause-claiming").touch()
         self._clear_hook()
         for doc_id in self.doc_ids:
-            with closing(connect()) as db:
-                db.execute("DELETE FROM extraction_evidence WHERE run_id IN "
-                           "(SELECT id FROM extraction_runs WHERE document_id=?)", (doc_id,))
-                for table in ("extraction_fields", "extraction_lines", "extraction_pages"):
-                    db.execute(f"DELETE FROM {table} WHERE run_id IN "
-                               "(SELECT id FROM extraction_runs WHERE document_id=?)", (doc_id,))
-                db.execute("DELETE FROM extraction_runs WHERE document_id=?", (doc_id,))
-                row = db.execute("SELECT object_key FROM jobs WHERE id=?", (doc_id,)).fetchone()
-                db.execute("DELETE FROM generations WHERE job_id=?", (doc_id,))
-                db.execute("DELETE FROM jobs WHERE id=?", (doc_id,))
-                db.commit()
+            with psycopg.connect(os.environ["DATABASE_ADMIN_URL"], row_factory=dict_row) as db:
+                with db.transaction():
+                    db.execute("SET LOCAL ROLE extraction_retention_operator")
+                    run_ids = [row["id"] for row in db.execute(
+                        "SELECT id FROM extraction_runs WHERE document_id=%s", (doc_id,))]
+                    for run_id in run_ids:
+                        db.execute("SELECT retire_extraction_run(%s)", (run_id,))
+                    db.execute("RESET ROLE")
+                row = db.execute("SELECT object_key FROM jobs WHERE id=%s", (doc_id,)).fetchone()
+                db.execute("DELETE FROM generations WHERE job_id=%s", (doc_id,))
+                db.execute("DELETE FROM jobs WHERE id=%s", (doc_id,))
             if row and row["object_key"]:
                 try:
                     delete_object(row["object_key"])
@@ -321,7 +322,7 @@ class Phase0CIntegrationTests(unittest.TestCase):
         doc_id = self._upload(f"Activation rollback record {uuid.uuid4().hex}")
         old_generation = self._publish_initial(doc_id)
         job = self._requeue_claim(doc_id)
-        with closing(connect()) as db:
+        with psycopg.connect(os.environ["DATABASE_ADMIN_URL"]) as db:
             db.execute("""CREATE OR REPLACE FUNCTION phase0c_reject_activation() RETURNS trigger AS $$
                 BEGIN
                   IF NEW.id = '%s' AND NEW.active_generation_id IS DISTINCT FROM OLD.active_generation_id THEN
@@ -341,10 +342,9 @@ class Phase0CIntegrationTests(unittest.TestCase):
             self.assertEqual(self.es.count(index=INDEX,
                 query={"term": {"generation": old_generation}})["count"], 1)
         finally:
-            with closing(connect()) as db:
+            with psycopg.connect(os.environ["DATABASE_ADMIN_URL"]) as db:
                 db.execute("DROP TRIGGER IF EXISTS phase0c_reject_activation ON jobs")
                 db.execute("DROP FUNCTION IF EXISTS phase0c_reject_activation()")
-                db.commit()
 
     def test_search_during_reindex_only_reads_the_previous_generation(self):
         text = f"Searchable legacy source phrase {uuid.uuid4().hex}"

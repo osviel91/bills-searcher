@@ -27,11 +27,12 @@ def save_execution(execution: ExtractionExecution, path=None):
         if any(key in item.values for key in ("amount", "unit_price", "price")) and not item.evidence:
             raise ValueError("Monetary line values require document evidence")
     with connect(path) as db:
+        initial_status = "running" if db.postgres else execution.status
         db.execute("""INSERT INTO extraction_runs
             (id,document_id,extractor_version,status,warnings_json,error)
             VALUES(?,?,?,?,?,?)""", (
                 execution.id, execution.document_id, execution.extractor_version,
-                execution.status, _json(execution.warnings), execution.error,
+                initial_status, _json(execution.warnings), execution.error,
             ))
         for page in execution.pages:
             db.execute("INSERT INTO extraction_pages(run_id,page_number,structure_json) VALUES(?,?,?)",
@@ -62,3 +63,6 @@ def save_execution(execution: ExtractionExecution, path=None):
                     execution.id, number, evidence.page_number, evidence.block_id,
                         evidence.quote, _bounds(evidence.bounds),
                     ))
+        if db.postgres:
+            db.execute("UPDATE extraction_runs SET status=?,finished_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (execution.status, execution.id))

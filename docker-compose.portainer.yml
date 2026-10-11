@@ -13,6 +13,17 @@ services:
       timeout: 5s
       retries: 20
 
+  schema-migrate:
+    build: .
+    command: python migrate_schema.py
+    environment:
+      DATABASE_MIGRATION_URL: ${DATABASE_MIGRATION_URL:?Set DATABASE_MIGRATION_URL in the Stack}
+      APP_DB_USER: ${APP_DB_USER:?Set APP_DB_USER in the Stack}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in the Stack}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   app:
     build: .
     command: uvicorn app:app --host 0.0.0.0 --port 8000
@@ -42,8 +53,8 @@ services:
     volumes:
       - embedding-settings-data:/data
     depends_on:
-      postgres:
-        condition: service_healthy
+      schema-migrate:
+        condition: service_completed_successfully
 
   worker:
     build: .
@@ -52,8 +63,8 @@ services:
     volumes:
       - embedding-settings-data:/data
     depends_on:
-      postgres:
-        condition: service_healthy
+      schema-migrate:
+        condition: service_completed_successfully
 
 volumes:
   embedding-settings-data:

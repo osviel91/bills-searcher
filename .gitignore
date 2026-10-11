@@ -1,5 +1,7 @@
 .env
 .env.runtime
+.env.migration
+.env.runtime.app
 .venv/
 __pycache__/
 *.pyc
