@@ -144,9 +144,10 @@ def _validate_evidence(evidence):
 
 
 def adapt_template_result(classification, extractor_id, extractor_version, fields, lines=(), *,
-                          document_id, document_sha256, attempt_id, idempotency_key,
-                          extractor_set_fingerprint, result_schema_version=1,
-                          execution_mode="specialized", line_extractor=None, warnings=()):
+                          document_id, document_sha256, attempt_id, extractor_set_fingerprint,
+                          idempotency_key=None, result_schema_version=1,
+                          execution_mode="specialized", line_extractor=None, warnings=(),
+                          operation_id="default"):
     components = []
     if extractor_id and extractor_version:
         components.append(Component(extractor_id, extractor_version))
@@ -154,6 +155,14 @@ def adapt_template_result(classification, extractor_id, extractor_version, field
         components.append(Component(line_extractor.id, line_extractor.version))
     if not components:
         components.append(Component(classification.detector_id, classification.detector_version))
+    if idempotency_key is None:
+        idempotency_key = make_idempotency_key(
+            document_id=document_id, document_sha256=document_sha256,
+            execution_mode=execution_mode, detector_id=classification.detector_id,
+            detector_version=classification.detector_version, template=classification.template,
+            components=tuple(components), extractor_set_fingerprint=extractor_set_fingerprint,
+            result_schema_version=result_schema_version, operation_id=operation_id,
+        )
     reason = classification.reason if classification.template == "unknown" else None
     result = SpecializedResult(
         document_id, document_sha256, attempt_id, execution_mode, classification.detector_id,
@@ -174,6 +183,21 @@ def _payload_fingerprint(result):
         "diagnostics": result.diagnostics_code, "error": result.error,
     }
     return hashlib.sha256(_encode(material).encode()).hexdigest()
+
+
+def make_idempotency_key(*, document_id, document_sha256, execution_mode, detector_id,
+                         detector_version, template, components, extractor_set_fingerprint,
+                         result_schema_version, operation_id="default"):
+    """Build the same logical operation key after a caller process restarts."""
+    material = {
+        "key_version": 1, "document_id": document_id, "document_sha256": document_sha256,
+        "execution_mode": execution_mode, "detector": (detector_id, detector_version),
+        "template": template, "components": [(c.id, c.version) for c in components],
+        "extractor_set_fingerprint": extractor_set_fingerprint,
+        "result_schema_version": result_schema_version, "operation_id": operation_id,
+    }
+    digest = hashlib.sha256(_encode(material).encode()).hexdigest()
+    return f"specialized-v1:{digest}"
 
 
 def write_specialized_result(result: SpecializedResult, path=None) -> WriteResult:

@@ -123,6 +123,20 @@ class SpecializedWriterContractTests(unittest.TestCase):
         self.assertNotEqual(_payload_fingerprint(baseline), _payload_fingerprint(evidence_changed))
         self.assertNotEqual(_payload_fingerprint(baseline), _payload_fingerprint(candidates_changed))
 
+    def test_adapted_idempotency_key_survives_process_restart_and_attempt_change(self):
+        classification = TemplateDetection("T02", "router", "1", {}, None)
+        arguments = dict(document_id="doc", document_sha256="a" * 64, extractor_set_fingerprint="b" * 64)
+        fields = (ExtractedField("total_due", Decimal("12.30"), status="confirmed"),)
+        first = adapt_template_result(classification, "header", "1", fields,
+            attempt_id="attempt-one", **arguments)
+        restarted = adapt_template_result(classification, "header", "1", fields,
+            attempt_id="attempt-two", **arguments)
+        intentional_replay = adapt_template_result(classification, "header", "1", fields,
+            attempt_id="attempt-two", operation_id="rerun-2", **arguments)
+        self.assertEqual(first.idempotency_key, restarted.idempotency_key)
+        self.assertNotEqual(first.run_id, restarted.run_id)
+        self.assertNotEqual(first.idempotency_key, intentional_replay.idempotency_key)
+
 
 if __name__ == "__main__":
     unittest.main()
