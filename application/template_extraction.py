@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 
 from application.extractor_registry import template_extractor_for
 from application.template_detection import TemplateDetection, detect_template
-from domain.structured_extraction import BoundingBox, Evidence, ExtractedField, PDFPage, PDFToken
+from domain.structured_extraction import BoundingBox, Evidence, ExtractedField, PDFPage, PDFToken, ProposedLine
 from infrastructure.pdf_extraction import extract_pdf, extract_pdf_tokens
 
 
@@ -69,10 +69,10 @@ def _full_matches(tokens, pattern):
     return result
 
 
-def _rows(tokens, page):
+def _rows(tokens, page, tolerance=2.5):
     rows = []
     for token in sorted((t for t in tokens if "-v" not in t.id), key=lambda t: (t.bounds.top, t.bounds.x0)):
-        if rows and abs(token.bounds.top - rows[-1][0]) <= 2.5:
+        if rows and abs(token.bounds.top - rows[-1][0]) <= tolerance:
             rows[-1][1].append(token)
         else:
             rows.append((token.bounds.top, [token]))
@@ -445,6 +445,197 @@ def extract_t01_header_summary(pages, token_pages):
 
 def extract_t02_header_summary(pages, token_pages):
     return _extract_template(pages, token_pages, "T02", template_extractor_for("T02"))
+
+
+_LINE_HEADERS = {
+    "T01": ("CONCEPTO", "ALBARAN", "FECHA", "T.CHEQUES", "TOTAL"),
+    "T02": ("DESCRIPCION", "CANTIDAD", "IMP. UNIDAD", "IMPORTE", "TIPO IVA", "CUOTA IVA", "TOTAL"),
+}
+
+
+def _line_header(tokens, page, template):
+    expected = _LINE_HEADERS[template]
+    body = [token for token in tokens if "-v" not in token.id]
+    rows = _rows(tokens, page, tolerance=8)
+    anchors = [token for token in body if _norm(token.text) == expected[0]]
+    for anchor in anchors:
+        center_y = (anchor.bounds.top + anchor.bounds.bottom) / 2
+        neighborhood = sorted((token for token in body
+                               if abs((token.bounds.top + token.bounds.bottom) / 2 - center_y) <= 13),
+                              key=lambda token: (token.bounds.x0, token.bounds.top))
+        spans = []
+        for label in expected:
+            if template == "T02" and label == "TIPO IVA":
+                group = [token for token in neighborhood
+                         if 0.67 <= token.bounds.x0 / page.width <= 0.76
+                         and _norm(token.text) in {"T", "I", "P", "O", "V", "A"}]
+                if group:
+                    spans.append((label, min(t.bounds.x0 for t in group), max(t.bounds.x1 for t in group)))
+                    continue
+            target = _norm(label).replace(" ", "")
+            matches = []
+            for start in range(len(neighborhood)):
+                for end in range(start + 1, min(len(neighborhood), start + 6) + 1):
+                    group = neighborhood[start:end]
+                    if max(item.bounds.top for item in group) - min(item.bounds.top for item in group) > 13:
+                        continue
+                    if _norm(" ".join(item.text for item in group)).replace(" ", "") == target:
+                        matches.append(group)
+            if len(matches) != 1:
+                break
+            group = matches[0]
+            spans.append((label, min(t.bounds.x0 for t in group), max(t.bounds.x1 for t in group)))
+        if len(spans) == len(expected):
+            end_row = max(index for index, row in enumerate(rows)
+                          if any(abs((token.bounds.top + token.bounds.bottom) / 2 - center_y) <= 13
+                                 for token in row))
+            return end_row, tuple(spans), None
+    return None, (), "detail-header-not-found"
+
+
+def _line_decimal(text):
+    raw = text.strip().replace("€", "").replace("EUR", "").replace(" ", "")
+    if not re.fullmatch(r"[+-]?(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d+)?", raw):
+        return None
+    try:
+        return Decimal(raw.replace(".", "").replace(",", "."))
+    except InvalidOperation:
+        return None
+
+
+def extract_template_lines(pages, token_pages, template):
+    """Offline geometric row reconstruction; unsupported layouts abstain explicitly."""
+    if template not in _LINE_HEADERS:
+        return (), ("unsupported-template",)
+    if len(pages) != 1 or len(token_pages) != 1:
+        return (), ("multipage-detail-not-supported",)
+    page, tokens = pages[0], token_pages[0]
+    header_index, labels, warning = _line_header(tokens, page, template)
+    if warning:
+        return (), (warning,)
+    labels = sorted(labels, key=lambda item: item[1])
+    boundaries = [0.0] + [right[1] if template == "T02" and index == 0 else (left[2] + right[1]) / 2
+                          for index, (left, right) in enumerate(zip(labels, labels[1:]))] + [page.width]
+    detail_end = page.height * (0.75 if template == "T01" else 0.71)
+    rows = _rows(tokens, page, tolerance=8)
+    header_y = min((label[1] for label in labels), default=0)
+    from application.extractor_registry import template_line_extractor_for
+    extractor = template_line_extractor_for(template)
+    lines = []
+    pending_description = []
+    pending_evidence = []
+    previous_y = header_y
+    for row in rows[header_index + 1:]:
+        y = min(t.bounds.top for t in row)
+        if y > detail_end:
+            break
+        text = " ".join(t.text for t in row).strip()
+        normalized = _norm(text)
+        if re.search(r"\b(SUBTOTAL|BASE IMPONIBLE|TOTAL FACTURA|TOTAL A PAGAR)\b", normalized):
+            break
+        if template == "T01" and re.search(r"\b(COMISION|FORFAIT|GASTOS ENVIO)\b", normalized):
+            break
+        note_tokens = [token for token in row
+                       if (token.bounds.x0 + token.bounds.x1) / 2 < boundaries[1]]
+        note_text = " ".join(token.text for token in note_tokens).strip()
+        if template == "T02" and "ANULA FACTURA" in _norm(note_text):
+            note_evidence = tuple(_evidence(_span(token, 0, len(token.text)), None,
+                "document-cancellation-note", extractor) for token in note_tokens)
+            lines.append(ProposedLine(note_text, {"row_type": "cancellation", "document_note": True},
+                                      note_evidence, ("document-cancellation-note",)))
+            previous_y = y
+            continue
+        cells = [[] for _ in labels]
+        for token in row:
+            center = (token.bounds.x0 + token.bounds.x1) / 2
+            column = next((i for i in range(len(labels)) if boundaries[i] <= center < boundaries[i + 1]), None)
+            if column is not None:
+                cells[column].append(token)
+        desc_tokens = cells[0]
+        numeric = {}
+        for index, label in enumerate(labels[1:], start=1):
+            if template == "T01" and label[0] == "FECHA":
+                date_tokens = [token for token in cells[index] if _parse_date(token.text) is not None]
+                if len(date_tokens) == 1:
+                    numeric[label[0]] = (_parse_date(date_tokens[0].text), date_tokens[0])
+                continue
+            values = [(_line_decimal(token.text), token) for token in cells[index]]
+            values = [(value, token) for value, token in values if value is not None]
+            if len(values) > 1:
+                return tuple(lines), ("multiple-values-in-column",)
+            if values:
+                numeric[label[0]] = values[0]
+        description = " ".join(token.text for token in desc_tokens).strip()
+        if template == "T02" and _norm(description).startswith("NUMERO DE BENEFICIARIOS"):
+            ev = tuple(_evidence(_span(token, 0, len(token.text)), None, "detail-description-column", extractor)
+                       for token in desc_tokens)
+            values = {"row_type": "informational", "row_order": len(lines) + 1}
+            if "CANTIDAD" in numeric:
+                values["quantity"] = numeric["CANTIDAD"][0]
+                _, token = numeric["CANTIDAD"]
+                ev += (_evidence(_span(token, 0, len(token.text)), None, "detail-column-center", extractor),)
+            lines.append(ProposedLine(description, values, ev,
+                                      ("informational-row-no-charge",)))
+            previous_y = y
+            continue
+        if not numeric:
+            if description:
+                if pending_description and y - previous_y > 18:
+                    lines.append(ProposedLine(" ".join(pending_description), {"row_type": "unknown",
+                        "row_order": len(lines) + 1}, tuple(pending_evidence), ("unassociated-description-band",)))
+                    pending_description, pending_evidence = [], []
+                pending_description.append(description)
+                pending_evidence.extend(_evidence(_span(token, 0, len(token.text)), None,
+                    "detail-description-column", extractor) for token in desc_tokens)
+            previous_y = y
+            continue
+        if not description and lines and y - previous_y <= 24:
+            prior = lines[-1]
+            values = {**prior.values}
+            values.update({key: number for key, (number, _) in numeric.items()})
+            evidence = prior.evidence + tuple(_evidence(_span(token, 0, len(token.text)), None,
+                "detail-column-center", extractor) for _, token in numeric.values())
+            lines[-1] = ProposedLine(prior.description, values, evidence, prior.warnings)
+            previous_y = y
+            continue
+        if description:
+            if pending_description:
+                lines.append(ProposedLine(" ".join(pending_description),
+                    {"row_type": "informational", "document_note": True}, tuple(pending_evidence),
+                    ("unpriced-description-band", "ambiguous-description-prefix")))
+                pending_description, pending_evidence = [], []
+            pending_description.append(description)
+            pending_evidence.extend(_evidence(_span(token, 0, len(token.text)), None,
+                "detail-description-column", extractor) for token in desc_tokens)
+        desc = " ".join(pending_description) or None
+        evidence = list(pending_evidence)
+        values = {"row_order": len(lines) + 1, "row_type": "unknown"}
+        for label, (number, token) in numeric.items():
+            if template == "T01":
+                key = {"ALBARAN": "reference", "FECHA": "line_date", "T.CHEQUES": "t_cheques_unverified",
+                       "TOTAL": "documentary_total"}.get(label)
+            else:
+                key = {"CANTIDAD": "quantity", "IMP. UNIDAD": "unit_price", "IMPORTE": "amount",
+                       "TIPO IVA": "vat_rate", "CUOTA IVA": "vat_amount", "TOTAL": "total"}.get(label)
+            if key:
+                values[key] = number
+                evidence.append(_evidence(_span(token, 0, len(token.text)), None,
+                    "detail-column-center", extractor))
+        if template == "T02" and "amount" in values:
+            values["row_type"] = "discount" if _norm(desc or "").startswith("DESCUENTO") else "charge"
+        elif template == "T01" and "documentary_total" in values:
+            values["row_type"] = "charge"
+        if re.search(r"\bANULA\b|\bCANCELA", _norm(desc or "")):
+            values["row_type"] = "cancellation"
+        lines.append(ProposedLine(desc, values, tuple(evidence)))
+        pending_description, pending_evidence = [], []
+        previous_y = y
+    if pending_description and template == "T02":
+        lines.append(ProposedLine(" ".join(pending_description), {"row_type": "unknown",
+            "row_order": len(lines) + 1}, tuple(pending_evidence), ("unassociated-description-band",)))
+    if template == "T01":
+        lines = [line for line in lines if line.description and line.values.get("row_type") == "charge"]
+    return tuple(lines), ()
 
 
 def extract_classified_header_summary(pages, token_pages, classification=None) -> TemplateExtraction:

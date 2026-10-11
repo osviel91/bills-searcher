@@ -4,7 +4,8 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from application.extractor_registry import EXTRACTORS, TEMPLATE_EXTRACTORS
-from application.template_extraction import extract_as400_header_summary, extract_t01_header_summary, extract_t02_header_summary
+from application.template_extraction import (extract_as400_header_summary, extract_t01_header_summary,
+                                             extract_t02_header_summary, extract_template_lines)
 from domain.structured_extraction import BoundingBox, PDFPage, PDFToken, TableRegion
 
 
@@ -77,11 +78,139 @@ def t01_fixture(*, summary=True):
     return (PDFPage(1, page.width, page.height, "", tables=(table,)),), (tuple(tokens),)
 
 
+def t02_line_fixture(detail_tokens):
+    page = PDFPage(1, 1000, 1000, "")
+    header = tuple(token(text, x, 300) for text, x in (
+        ("DESCRIPCION", 40), ("CANTIDAD", 390), ("IMP.", 510), ("UNIDAD", 540),
+        ("IMPORTE", 640), ("TIPO IVA", 730), ("CUOTA IVA", 810), ("TOTAL", 920),
+    ))
+    return page, header + tuple(token(text, x, y) for text, x, y in detail_tokens)
+
+
 def by_name(fields):
     return {field.name: field for field in fields}
 
 
 class TemplateExtractionTests(unittest.TestCase):
+    def test_offline_t02_lines_preserve_columns_sign_and_field_evidence(self):
+        page = PDFPage(1, 1000, 1000, "")
+        tokens = tuple(token(text, x, y) for text, x, y in (
+            ("DESCRIPCION", 40, 300), ("CANTIDAD", 390, 300), ("IMP.", 510, 300),
+            ("UNIDAD", 540, 300), ("IMPORTE", 640, 300), ("TIPO IVA", 730, 300),
+            ("CUOTA IVA", 810, 300), ("TOTAL", 920, 300),
+            ("WALLET", 40, 350), ("COMIDA", 40, 363), ("2,00", 430, 376),
+            ("-5,00", 550, 376), ("-10,00", 660, 376), ("21,00", 745, 376),
+            ("-2,10", 825, 376), ("-12,10", 930, 376),
+        ))
+        lines, warnings = extract_template_lines((page,), (tokens,), "T02")
+        self.assertEqual(warnings, ())
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].description, "WALLET COMIDA")
+        self.assertEqual(lines[0].values["row_type"], "charge")
+        self.assertEqual(lines[0].values["unit_price"], Decimal("-5.00"))
+        self.assertEqual(lines[0].values["amount"], Decimal("-10.00"))
+        self.assertEqual(lines[0].values["total"], Decimal("-12.10"))
+        self.assertTrue(all(item.bounds and item.source_token_ids for item in lines[0].evidence))
+
+    def test_offline_detail_abstains_for_multipage_and_unknown_templates(self):
+        page = PDFPage(1, 1000, 1000, "")
+        self.assertEqual(extract_template_lines((page, page), ((), ()), "T02")[1],
+                         ("multipage-detail-not-supported",))
+        self.assertEqual(extract_template_lines((page,), ((),), "unknown")[1],
+                         ("unsupported-template",))
+
+    def test_description_column_includes_text_before_quantity_header(self):
+        page, tokens = t02_line_fixture((
+            ("WALLET", 40, 350), ("TRANSPORTE", 100, 350), ("AGOSTO/2026", 300, 350),
+            ("2,00", 430, 350), ("6,00", 550, 350), ("12,00", 660, 350),
+            ("21,00", 745, 350), ("2,52", 825, 350), ("14,52", 930, 350),
+        ))
+        lines, warnings = extract_template_lines((page,), (tokens,), "T02")
+        self.assertEqual(warnings, ())
+        self.assertEqual(lines[0].description, "WALLET TRANSPORTE AGOSTO/2026")
+
+    def test_multiline_description_survives_nonvalued_continuation_rows(self):
+        page, tokens = t02_line_fixture((
+            ("WALLET", 40, 350), ("COMIDA", 40, 362),
+            ("2,00", 430, 374), ("4,00", 550, 374), ("8,00", 660, 374),
+            ("21,00", 745, 374), ("1,68", 825, 374), ("9,68", 930, 374),
+        ))
+        lines, warnings = extract_template_lines((page,), (tokens,), "T02")
+        self.assertEqual(warnings, ())
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].description, "WALLET COMIDA")
+
+    def test_unpriced_section_heading_does_not_prefix_the_next_charge(self):
+        page, tokens = t02_line_fixture((
+            ("SERVICIO", 40, 350), ("RETRIPLUS", 100, 350),
+            ("UPRETRIPLUS", 40, 362), ("PLAN", 120, 362), ("JULIO/2026", 160, 362),
+            ("1,00", 430, 362), ("-40,00€", 550, 362), ("-40,00", 660, 362),
+            ("21,00", 745, 362), ("-8,40", 825, 362), ("-48,40", 930, 362),
+        ))
+        lines, warnings = extract_template_lines((page,), (tokens,), "T02")
+        self.assertEqual(warnings, ())
+        charges = [line for line in lines if not line.values.get("document_note")]
+        notes = [line for line in lines if line.values.get("document_note")]
+        self.assertEqual(len(charges), 1)
+        self.assertEqual(charges[0].description, "UPRETRIPLUS PLAN JULIO/2026")
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].values["row_type"], "informational")
+        self.assertTrue(all(ev.bounds and ev.source_token_ids for ev in notes[0].evidence))
+
+    def test_cancellation_note_near_charge_does_not_change_its_classification(self):
+        page, tokens = t02_line_fixture((
+            ("WALLET", 40, 350), ("COMIDA", 100, 350), ("1,00", 430, 350),
+            ("-4,00€", 550, 350), ("-4,00", 660, 350), ("21,00", 745, 350),
+            ("-0,84", 825, 350), ("-4,84", 930, 350),
+            ("****", 40, 374), ("ANULA", 70, 374), ("FACTURA", 110, 374), ("12345678", 180, 374), ("****", 250, 374),
+        ))
+        lines, warnings = extract_template_lines((page,), (tokens,), "T02")
+        self.assertEqual(warnings, ())
+        charge = next(line for line in lines if not line.values.get("document_note"))
+        note = next(line for line in lines if line.values.get("document_note"))
+        self.assertEqual(charge.values["row_type"], "charge")
+        self.assertEqual(note.values["row_type"], "cancellation")
+        self.assertTrue(note.warnings)
+
+    def test_independent_cancellation_note_is_not_emitted_as_a_charge(self):
+        page, tokens = t02_line_fixture((
+            ("****", 40, 350), ("ANULA", 70, 350), ("FACTURA", 110, 350),
+            ("12345678", 180, 350), ("****", 250, 350),
+        ))
+        lines, warnings = extract_template_lines((page,), (tokens,), "T02")
+        self.assertEqual(warnings, ())
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].values["document_note"])
+        self.assertEqual(lines[0].values["row_type"], "cancellation")
+        self.assertTrue(all(e.bounds and e.source_token_ids for e in lines[0].evidence))
+
+    def test_informational_beneficiary_row_preserves_quantity_only(self):
+        page, tokens = t02_line_fixture((
+            ("NUMERO", 40, 350), ("DE", 100, 350), ("BENEFICIARIOS", 120, 350), ("15,00", 430, 350),
+        ))
+        lines, warnings = extract_template_lines((page,), (tokens,), "T02")
+        self.assertEqual(warnings, ())
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].values["row_type"], "informational")
+        self.assertEqual(lines[0].values["quantity"], Decimal("15.00"))
+        self.assertNotIn("amount", lines[0].values)
+        self.assertTrue(any(ev.quote == "15,00" for ev in lines[0].evidence))
+
+    def test_separate_discounts_and_near_duplicate_charges_remain_independent(self):
+        detail = []
+        for y, description, amount in ((350, "WALLET COMIDA", "10,00"),
+                                       (362, "WALLET COMIDA", "5,00"),
+                                       (374, "DESCUENTO 50,00%", "-5,00"),
+                                       (386, "DESCUENTO 20,00%", "-1,00")):
+            detail.extend(((description, 40, y), ("1,00", 430, y), (amount, 660, y), ("21,00", 745, y),
+                           ("1,05", 825, y), ("11,05", 930, y)))
+        page, tokens = t02_line_fixture(tuple(detail))
+        lines, warnings = extract_template_lines((page,), (tokens,), "T02")
+        self.assertEqual(warnings, ())
+        self.assertEqual(len(lines), 4)
+        self.assertEqual([line.values["row_type"] for line in lines],
+                         ["charge", "charge", "discount", "discount"])
+
     def test_t02_header_summary_dates_and_role_ids_have_precise_evidence(self):
         pages, tokens = t02_fixture(dates=("03.09.2026", "04.09.2026"))
         fields, warnings = extract_t02_header_summary(pages, tokens)

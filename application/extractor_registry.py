@@ -64,6 +64,31 @@ TEMPLATE_EXTRACTORS = (
 )
 
 
+def _extract_t01_lines(pages, tokens):
+    from application.template_extraction import extract_template_lines
+    lines, warnings = extract_template_lines(pages, tokens, "T01")
+    return (), lines, warnings
+
+
+def _extract_t02_lines(pages, tokens):
+    from application.template_extraction import extract_template_lines
+    lines, warnings = extract_template_lines(pages, tokens, "T02")
+    return (), lines, warnings
+
+
+TEMPLATE_LINE_EXTRACTORS = (
+    Extractor("as400-t01-lines", "1", 1, _template_matches("T01"), _extract_t01_lines),
+    Extractor("as400-t02-lines", "1", 1, _template_matches("T02"), _extract_t02_lines),
+)
+
+
+def template_line_extractor_for(template):
+    for extractor in TEMPLATE_LINE_EXTRACTORS:
+        if extractor.id == f"as400-{template.lower()}-lines":
+            return extractor
+    raise ValueError(f"No offline line extractor for {template}")
+
+
 def template_extractor_for(template):
     for extractor in TEMPLATE_EXTRACTORS:
         if extractor.id == f"as400-{template.lower()}-header-summary":
