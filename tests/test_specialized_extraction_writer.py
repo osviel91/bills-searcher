@@ -5,7 +5,9 @@ from decimal import Decimal
 from application.template_detection import TemplateDetection
 from domain.structured_extraction import BoundingBox, Evidence, ExtractedField, ProposedLine
 from infrastructure.specialized_extraction_writer import (
-    Component, SpecializedResult, _encode, _payload_fingerprint, adapt_template_result,
+    MAX_SPECIALIZED_RESULT_TRANSFER_BYTES, Component, SpecializedResult, _encode,
+    _payload_fingerprint, adapt_template_result, deserialize_specialized_result,
+    serialize_specialized_result,
 )
 from test_template_extraction import t01_fixture, t02_fixture
 from application.template_extraction import extract_t01_header_summary, extract_t02_header_summary
@@ -136,6 +138,31 @@ class SpecializedWriterContractTests(unittest.TestCase):
         self.assertEqual(first.idempotency_key, restarted.idempotency_key)
         self.assertNotEqual(first.run_id, restarted.run_id)
         self.assertNotEqual(first.idempotency_key, intentional_replay.idempotency_key)
+
+    def test_specialized_result_json_transfer_roundtrips_decimal_and_evidence_with_a_hard_limit(self):
+        evidence = Evidence(2, "-12,30", BoundingBox(1, 2, 3, 4), "block-2",
+                            method="table-cell", extractor_id="lines", extractor_version="1",
+                            source_token_ids=("token-1",))
+        result = SpecializedResult(
+            "doc", "a" * 64, "attempt", "shadow-specialized", "router", "1", "T02",
+            (Component("header", "1"), Component("lines", "1")), "b" * 64, 1, "stable-key",
+            (ExtractedField("amount", Decimal("-12.30"), evidence=(evidence,),
+                            status="confirmed", candidates=(Decimal("-12.30"),)),),
+            (ProposedLine("synthetic", {"amount": Decimal("-12.30"), "row_type": "discount"},
+                          (evidence,)),), "succeeded",
+        ).validate()
+        decoded = deserialize_specialized_result(serialize_specialized_result(result))
+        self.assertEqual(decoded.idempotency_key, result.idempotency_key)
+        self.assertEqual(decoded.attempt_id, result.attempt_id)
+        self.assertEqual(decoded.fields[0].value, Decimal("-12.30"))
+        self.assertEqual(decoded.fields[0].evidence[0].page_number, 2)
+        self.assertEqual(decoded.lines[0].values["row_type"], "discount")
+        with self.assertRaisesRegex(ValueError, "transfer shape"):
+            deserialize_specialized_result(b'{"unexpected":true}')
+        with self.assertRaisesRegex(ValueError, "transfer size limit"):
+            serialize_specialized_result(result, max_bytes=1)
+        with self.assertRaisesRegex(ValueError, "transfer exceeds the size limit"):
+            deserialize_specialized_result(b" " * (MAX_SPECIALIZED_RESULT_TRANSFER_BYTES + 1))
 
 
 if __name__ == "__main__":

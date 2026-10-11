@@ -17,6 +17,11 @@ _STATUSES = {"confirmed", "absent", "ambiguous", "not_applicable", "unreadable",
 _TERMINAL = {"succeeded", "failed", "discarded_fenced"}
 _SAFE_DIAGNOSTIC = re.compile(r"[A-Za-z0-9_.:-]{1,200}\Z")
 RESULT_FINGERPRINT_VERSION = 1
+MAX_SPECIALIZED_RESULT_TRANSFER_BYTES = 1_000_000
+
+
+class SpecializedResultPayloadTooLarge(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,11 @@ def _bounds(value):
     return _encode(value) if value else None
 
 
+def fingerprint_extractor_set(components: tuple[Component, ...]) -> str:
+    manifest = sorted((component.id, component.version) for component in components)
+    return hashlib.sha256(_encode(manifest).encode()).hexdigest()
+
+
 def _validate_evidence(evidence):
     if not isinstance(evidence, Evidence) or evidence.page_number < 1 or not evidence.quote:
         raise ValueError("evidence requires a positive page number and quote")
@@ -144,10 +154,11 @@ def _validate_evidence(evidence):
 
 
 def adapt_template_result(classification, extractor_id, extractor_version, fields, lines=(), *,
-                          document_id, document_sha256, attempt_id, extractor_set_fingerprint,
+                          document_id, document_sha256, attempt_id, extractor_set_fingerprint=None,
                           idempotency_key=None, result_schema_version=1,
                           execution_mode="specialized", line_extractor=None, warnings=(),
-                          operation_id="default"):
+                          operation_id="default", status="succeeded", error=None,
+                          diagnostics_code=None):
     components = []
     if extractor_id and extractor_version:
         components.append(Component(extractor_id, extractor_version))
@@ -155,6 +166,8 @@ def adapt_template_result(classification, extractor_id, extractor_version, field
         components.append(Component(line_extractor.id, line_extractor.version))
     if not components:
         components.append(Component(classification.detector_id, classification.detector_version))
+    if extractor_set_fingerprint is None:
+        extractor_set_fingerprint = fingerprint_extractor_set(tuple(components))
     if idempotency_key is None:
         idempotency_key = make_idempotency_key(
             document_id=document_id, document_sha256=document_sha256,
@@ -168,7 +181,8 @@ def adapt_template_result(classification, extractor_id, extractor_version, field
         document_id, document_sha256, attempt_id, execution_mode, classification.detector_id,
         classification.detector_version, classification.template, tuple(components),
         extractor_set_fingerprint, result_schema_version, idempotency_key, tuple(fields), tuple(lines),
-        "succeeded", tuple(warnings), abstention_reason=reason,
+        status, tuple(warnings), error=error, abstention_reason=reason,
+        diagnostics_code=diagnostics_code,
     )
     return result.validate()
 
@@ -198,6 +212,193 @@ def make_idempotency_key(*, document_id, document_sha256, execution_mode, detect
     }
     digest = hashlib.sha256(_encode(material).encode()).hexdigest()
     return f"specialized-v1:{digest}"
+
+
+def _pack_value(value):
+    if value is None:
+        return ["n"]
+    if isinstance(value, bool):
+        return ["b", value]
+    if isinstance(value, str):
+        return ["s", value]
+    if isinstance(value, int):
+        return ["i", value]
+    if isinstance(value, Decimal):
+        return ["d", str(value)]
+    if isinstance(value, date):
+        return ["date", value.isoformat()]
+    if isinstance(value, tuple):
+        return ["tuple", [_pack_value(item) for item in value]]
+    if isinstance(value, list):
+        return ["list", [_pack_value(item) for item in value]]
+    if isinstance(value, dict):
+        return ["map", [[key, _pack_value(value[key])] for key in sorted(value)]]
+    raise ValueError(f"unsupported transfer value: {type(value).__name__}")
+
+
+def _unpack_value(value):
+    if not isinstance(value, list) or not value or not isinstance(value[0], str):
+        raise ValueError("invalid specialized result transfer value")
+    kind = value[0]
+    if kind == "n" and len(value) == 1:
+        return None
+    if kind in {"b", "s", "i"} and len(value) == 2:
+        expected = {"b": bool, "s": str, "i": int}[kind]
+        if not isinstance(value[1], expected) or (kind == "i" and isinstance(value[1], bool)):
+            raise ValueError("invalid specialized result transfer scalar")
+        return value[1]
+    if kind == "d" and len(value) == 2:
+        return Decimal(value[1])
+    if kind == "date" and len(value) == 2:
+        return date.fromisoformat(value[1])
+    if kind in {"tuple", "list"} and len(value) == 2 and isinstance(value[1], list):
+        items = [_unpack_value(item) for item in value[1]]
+        return tuple(items) if kind == "tuple" else items
+    if kind == "map" and len(value) == 2 and isinstance(value[1], list):
+        pairs = value[1]
+        if any(not isinstance(pair, list) or len(pair) != 2 or not isinstance(pair[0], str)
+               for pair in pairs):
+            raise ValueError("invalid specialized result transfer mapping")
+        return {key: _unpack_value(item) for key, item in pairs}
+    raise ValueError("invalid specialized result transfer tag")
+
+
+def _pack_box(bounds):
+    return None if bounds is None else [bounds.x0, bounds.top, bounds.x1, bounds.bottom]
+
+
+def _unpack_box(bounds):
+    if bounds is None:
+        return None
+    if not isinstance(bounds, list) or len(bounds) != 4:
+        raise ValueError("invalid evidence bounds transfer")
+    from domain.structured_extraction import BoundingBox
+    return BoundingBox(*bounds)
+
+
+def _pack_evidence(evidence):
+    return {"page": evidence.page_number, "quote": evidence.quote, "bounds": _pack_box(evidence.bounds),
+            "block": evidence.block_id, "label_quote": evidence.label_quote,
+            "label_bounds": _pack_box(evidence.label_bounds), "method": evidence.method,
+            "extractor_id": evidence.extractor_id, "extractor_version": evidence.extractor_version,
+            "tokens": list(evidence.source_token_ids)}
+
+
+def _unpack_evidence(value):
+    return Evidence(value["page"], value["quote"], _unpack_box(value["bounds"]), value["block"],
+                    value["label_quote"], _unpack_box(value["label_bounds"]), value["method"],
+                    value["extractor_id"], value["extractor_version"], tuple(value["tokens"]))
+
+
+def serialize_specialized_result(result: SpecializedResult, *, max_bytes=MAX_SPECIALIZED_RESULT_TRANSFER_BYTES):
+    result.validate()
+    body = {
+        "document_id": result.document_id, "document_sha256": result.document_sha256,
+        "attempt_id": result.attempt_id, "execution_mode": result.execution_mode,
+        "detector_id": result.detector_id, "detector_version": result.detector_version,
+        "template": result.template, "components": [[c.id, c.version] for c in result.components],
+        "extractor_set_fingerprint": result.extractor_set_fingerprint,
+        "result_schema_version": result.result_schema_version, "idempotency_key": result.idempotency_key,
+        "fields": [[item.name, _pack_value(item.value), [_pack_evidence(ev) for ev in item.evidence],
+                    list(item.warnings), item.status, _pack_value(item.candidates)] for item in result.fields],
+        "lines": [[item.description, _pack_value(item.values), [_pack_evidence(ev) for ev in item.evidence],
+                   list(item.warnings)] for item in result.lines],
+        "status": result.status, "warnings": list(result.warnings), "error": result.error,
+        "abstention_reason": result.abstention_reason, "diagnostics_code": result.diagnostics_code,
+    }
+    try:
+        payload = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                             allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("specialized result cannot be serialized safely") from exc
+    if len(payload) > max_bytes:
+        raise SpecializedResultPayloadTooLarge("specialized result exceeds the transfer size limit")
+    return payload
+
+
+def deserialize_specialized_result(payload: bytes, *, max_bytes=MAX_SPECIALIZED_RESULT_TRANSFER_BYTES):
+    if not isinstance(payload, bytes) or len(payload) > max_bytes:
+        raise SpecializedResultPayloadTooLarge("specialized result transfer exceeds the size limit")
+    body = json.loads(payload)
+    required = {"document_id", "document_sha256", "attempt_id", "execution_mode", "detector_id",
+                "detector_version", "template", "components", "extractor_set_fingerprint",
+                "result_schema_version", "idempotency_key", "fields", "lines", "status", "warnings",
+                "error", "abstention_reason", "diagnostics_code"}
+    if not isinstance(body, dict) or set(body) != required:
+        raise ValueError("invalid specialized result transfer shape")
+    fields = tuple(ExtractedField(name, _unpack_value(value), tuple(_unpack_evidence(ev) for ev in evidence),
+                                  tuple(warnings), status, _unpack_value(candidates))
+                   for name, value, evidence, warnings, status, candidates in body["fields"])
+    lines = tuple(ProposedLine(description, _unpack_value(values),
+                               tuple(_unpack_evidence(ev) for ev in evidence), tuple(warnings))
+                  for description, values, evidence, warnings in body["lines"])
+    result = SpecializedResult(
+        body["document_id"], body["document_sha256"], body["attempt_id"], body["execution_mode"],
+        body["detector_id"], body["detector_version"], body["template"],
+        tuple(Component(*component) for component in body["components"]),
+        body["extractor_set_fingerprint"], body["result_schema_version"], body["idempotency_key"],
+        fields, lines, body["status"], tuple(body["warnings"]), body["error"],
+        body["abstention_reason"], body["diagnostics_code"],
+    )
+    return result.validate()
+
+
+def serialize_shadow_extraction_result(result, *, max_bytes=MAX_SPECIALIZED_RESULT_TRANSFER_BYTES):
+    classification = result["classification"]
+    line_extractor = result["line_extractor"]
+    body = {
+        "classification": {
+            "template": classification.template, "detector_id": classification.detector_id,
+            "detector_version": classification.detector_version,
+            "signals": _pack_value(classification.signals), "reason": classification.reason,
+        },
+        "extractor_id": result["extractor_id"], "extractor_version": result["extractor_version"],
+        "line_component": ([line_extractor.id, line_extractor.version] if line_extractor else None),
+        "fields": [[item.name, _pack_value(item.value), [_pack_evidence(ev) for ev in item.evidence],
+                    list(item.warnings), item.status, _pack_value(item.candidates)] for item in result["fields"]],
+        "lines": [[item.description, _pack_value(item.values), [_pack_evidence(ev) for ev in item.evidence],
+                   list(item.warnings)] for item in result["lines"]],
+        "warnings": list(result["warnings"]), "status": result["status"],
+        "error": result.get("error"), "diagnostics_code": result.get("diagnostics_code"),
+    }
+    try:
+        payload = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                             allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("shadow extraction result cannot be serialized safely") from exc
+    if len(payload) > max_bytes:
+        raise SpecializedResultPayloadTooLarge("shadow extraction result exceeds the transfer size limit")
+    return payload
+
+
+def deserialize_shadow_extraction_result(payload: bytes, *, max_bytes=MAX_SPECIALIZED_RESULT_TRANSFER_BYTES):
+    if not isinstance(payload, bytes) or len(payload) > max_bytes:
+        raise SpecializedResultPayloadTooLarge("shadow extraction transfer exceeds the size limit")
+    body = json.loads(payload)
+    required = {"classification", "extractor_id", "extractor_version", "line_component", "fields", "lines",
+                "warnings", "status", "error", "diagnostics_code"}
+    if not isinstance(body, dict) or set(body) != required:
+        raise ValueError("invalid shadow extraction transfer shape")
+    classification = body["classification"]
+    if not isinstance(classification, dict) or set(classification) != {
+            "template", "detector_id", "detector_version", "signals", "reason"}:
+        raise ValueError("invalid shadow classification transfer shape")
+    line_component = body["line_component"]
+    if line_component is not None:
+        line_component = Component(*line_component)
+    fields = tuple(ExtractedField(name, _unpack_value(value), tuple(_unpack_evidence(ev) for ev in evidence),
+                                  tuple(warnings), status, _unpack_value(candidates))
+                   for name, value, evidence, warnings, status, candidates in body["fields"])
+    lines = tuple(ProposedLine(description, _unpack_value(values),
+                               tuple(_unpack_evidence(ev) for ev in evidence), tuple(warnings))
+                  for description, values, evidence, warnings in body["lines"])
+    return {
+        "classification": {**classification, "signals": _unpack_value(classification["signals"])},
+        "extractor_id": body["extractor_id"], "extractor_version": body["extractor_version"],
+        "line_extractor": line_component, "fields": fields, "lines": lines,
+        "warnings": tuple(body["warnings"]), "status": body["status"],
+        "error": body["error"], "diagnostics_code": body["diagnostics_code"],
+    }
 
 
 def write_specialized_result(result: SpecializedResult, path=None) -> WriteResult:

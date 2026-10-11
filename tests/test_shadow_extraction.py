@@ -19,19 +19,28 @@ def _send_classification_then_sleep(send):
     time.sleep(10)
 
 
+def _send_large_diagnostic(send, payload):
+    send.send({"status": "succeeded", "payload": payload})
+    send.close()
+
+
 class ShadowExtractionTests(unittest.TestCase):
     def test_disabled_mode_does_not_check_attempt_or_spawn_detector(self):
-        with patch.dict("os.environ", {"AS400_SHADOW_ENABLED": "false"}), \
+        with patch.dict("os.environ", {"AS400_SHADOW_ENABLED": "false",
+                                       "AS400_SHADOW_PERSISTENCE_ENABLED": "true"}), \
              patch.object(shadow, "_still_current") as current, \
+             patch.object(shadow, "_document_sha256") as sha256, \
              patch.object(shadow, "_run_isolated") as isolated:
             self.assertIsNone(shadow.run("opaque-doc", "attempt-1", (), b"pdf", (), ()))
         current.assert_not_called()
+        sha256.assert_not_called()
         isolated.assert_not_called()
 
     def test_enabled_mode_logs_only_safe_child_diagnostic(self):
         diagnostic = {"status": "succeeded", "template": "T01", "fields_produced": 2,
                       "lines_produced": 1, "warnings": 0}
-        with patch.dict("os.environ", {"AS400_SHADOW_ENABLED": "true"}), \
+        with patch.dict("os.environ", {"AS400_SHADOW_ENABLED": "true",
+                                       "AS400_SHADOW_PERSISTENCE_ENABLED": "false"}), \
              patch.object(shadow, "_still_current", return_value=True), \
              patch.object(shadow, "_run_isolated", return_value=diagnostic), \
              patch.object(shadow.LOGGER, "info") as log:
@@ -40,9 +49,146 @@ class ShadowExtractionTests(unittest.TestCase):
         self.assertEqual(result["document_id"], "opaque-doc")
         self.assertEqual(result["attempt_id"], "attempt-1")
         self.assertIn("duration_ms", result)
+        self.assertEqual(result["shadow_status"], "succeeded")
+        self.assertEqual(result["persistence_status"], "disabled")
         self.assertIn("generic-invoice@1", result["extractor_versions"])
         log.assert_called_once()
         self.assertEqual(log.call_args.kwargs["extra"]["as400_shadow"], result)
+
+    def test_persistence_adapter_error_is_safe_and_does_not_call_writer(self):
+        from domain.structured_extraction import ExtractedField
+        from infrastructure import specialized_extraction_writer as writer
+
+        payload = {"classification": {"template": "T02", "detector_id": "router",
+                                       "detector_version": "1", "signals": {}, "reason": None},
+                   "extractor_id": "header", "extractor_version": "1", "line_extractor": None,
+                   "fields": (ExtractedField("total_due", "PRIVATE", status="confirmed"),),
+                   "lines": (), "warnings": (), "status": "succeeded"}
+        context = {"document_id": "doc-id", "attempt_id": "attempt-id",
+                   "document_sha256": "a" * 64}
+        with patch.object(writer, "adapt_template_result", side_effect=ValueError("private quote")), \
+             patch.object(writer, "write_specialized_result") as write:
+            result, specialized = shadow._adapt_shadow_extraction_result(payload, context)
+        self.assertEqual((result["persistence_status"], result["persistence_error_code"]),
+                         ("adapter_error", "specialized-adapter-error"))
+        self.assertIsNone(specialized)
+        self.assertNotIn("private quote", repr(result))
+        write.assert_not_called()
+
+    def test_persistence_sql_error_and_ambiguous_commit_are_distinct_and_redacted(self):
+        import psycopg
+        from domain.structured_extraction import ExtractedField
+        from infrastructure import specialized_extraction_writer as writer
+
+        payload = {"classification": {"template": "T02", "detector_id": "router",
+                                       "detector_version": "1", "signals": {}, "reason": None},
+                   "extractor_id": "header", "extractor_version": "1", "line_extractor": None,
+                   "fields": (ExtractedField("total_due", "PRIVATE", status="confirmed"),),
+                   "lines": (), "warnings": (), "status": "succeeded"}
+        context = {"document_id": "doc-id", "attempt_id": "attempt-id",
+                   "document_sha256": "a" * 64}
+        adapter_error, specialized = shadow._adapt_shadow_extraction_result(payload, context)
+        self.assertIsNone(adapter_error, adapter_error)
+        with patch.object(writer, "write_specialized_result",
+                          side_effect=psycopg.errors.ForeignKeyViolation("private quote")):
+            rolled_back = shadow._persist_specialized_result(specialized)
+        self.assertEqual((rolled_back["persistence_status"], rolled_back["persistence_error_code"]),
+                         ("error", "transaction-rolled-back"))
+        self.assertNotIn("private quote", repr(rolled_back))
+
+        with patch.object(writer, "write_specialized_result",
+                          side_effect=psycopg.OperationalError("private connection details")):
+            unknown = shadow._persist_specialized_result(specialized)
+        self.assertEqual((unknown["persistence_status"], unknown["persistence_error_code"]),
+                         ("indeterminate", "commit-outcome-unknown"))
+        self.assertEqual(rolled_back["idempotency_key"], unknown["idempotency_key"])
+        self.assertNotIn("private connection details", repr(unknown))
+
+    def test_oversized_interprocess_payload_is_rejected_before_writer(self):
+        from application.template_detection import TemplateDetection
+        from domain.structured_extraction import BoundingBox, Evidence, ExtractedField
+        from infrastructure.specialized_extraction_writer import Component, MAX_SPECIALIZED_RESULT_TRANSFER_BYTES
+
+        secret = "PRIVATE-EVIDENCE-" + "X" * MAX_SPECIALIZED_RESULT_TRANSFER_BYTES
+        payload = {"classification": TemplateDetection("T02", "router", "1", {}, None),
+                   "extractor_id": "header", "extractor_version": "1",
+                   "line_extractor": Component("lines", "1"),
+                   "fields": (ExtractedField("total_due", "PRIVATE", status="confirmed",
+                       evidence=(Evidence(1, secret, BoundingBox(1, 2, 3, 4)),)),),
+                   "lines": (), "warnings": (), "status": "succeeded"}
+        diagnostic = {"status": "succeeded", "template": "T02", "fields_produced": 1,
+                      "lines_produced": 0, "warnings": 0, "_specialized_result": payload}
+
+        class Sender:
+            def __init__(self):
+                self.messages = []
+
+            def send(self, message):
+                self.messages.append(message)
+
+            def close(self):
+                pass
+
+        sender = Sender()
+        with patch.object(shadow, "_diagnose", return_value=diagnostic):
+            shadow._diagnose_in_child(sender, (), b"synthetic", (), (), True)
+        final = sender.messages[-1]
+        self.assertEqual(final["persistence_status"], "payload_too_large")
+        self.assertNotIn("persistence_payload", final)
+        self.assertNotIn(secret, repr(sender.messages))
+
+    def test_isolated_pipe_drains_bounded_payload_larger_than_pipe_buffer(self):
+        payload = b"SYNTHETIC" * 60_000
+        result = shadow._run_isolated(_send_large_diagnostic, (payload,), 5)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["payload"], payload)
+
+    def test_malformed_interprocess_payload_is_rejected_before_writer(self):
+        from infrastructure import specialized_extraction_writer as writer
+
+        child_result = {"status": "succeeded", "template": "T02", "fields_produced": 1,
+                        "lines_produced": 0, "warnings": 0, "persistence_status": "prepared",
+                        "idempotency_key": "specialized-v1:test", "persistence_payload": b'{"broken":'}
+        with patch.dict("os.environ", {"AS400_SHADOW_ENABLED": "true",
+                                       "AS400_SHADOW_PERSISTENCE_ENABLED": "true"}), \
+             patch.object(shadow, "_still_current", return_value=True), \
+             patch.object(shadow, "_document_sha256", return_value="a" * 64), \
+             patch.object(shadow, "_run_isolated", return_value=child_result), \
+             patch.object(writer, "write_specialized_result") as write:
+            result = shadow.run("doc", "attempt", (), b"synthetic", (), (), timeout=1)
+        self.assertEqual(result["persistence_status"], "adapter_error")
+        self.assertEqual(result["persistence_error_code"], "specialized-deserialization-error")
+        write.assert_not_called()
+
+    def test_slow_writer_runs_outside_extraction_process_timeout(self):
+        import time as clock
+        from application.template_detection import TemplateDetection
+        from domain.structured_extraction import ExtractedField
+        from infrastructure.specialized_extraction_writer import serialize_shadow_extraction_result
+
+        payload = {"classification": TemplateDetection("T02", "router", "1", {}, None),
+                   "extractor_id": "header", "extractor_version": "1", "line_extractor": None,
+                   "fields": (ExtractedField("total_due", "12.30", status="confirmed"),),
+                   "lines": (), "warnings": (), "status": "succeeded"}
+        child_result = {"status": "succeeded", "template": "T02", "fields_produced": 1,
+                        "lines_produced": 0, "warnings": 0, "extraction_duration_ms": 1,
+                        "persistence_status": "prepared",
+                        "persistence_payload": serialize_shadow_extraction_result(payload)}
+
+        def slow_write(_result, _db_path):
+            clock.sleep(0.03)
+            return {"persistence_status": "created", "persistence_duration_ms": 30}
+
+        with patch.dict("os.environ", {"AS400_SHADOW_ENABLED": "true",
+                                       "AS400_SHADOW_PERSISTENCE_ENABLED": "true"}), \
+             patch.object(shadow, "_still_current", return_value=True), \
+             patch.object(shadow, "_document_sha256", return_value="a" * 64), \
+             patch.object(shadow, "_run_isolated", return_value=child_result), \
+             patch.object(shadow, "_persist_specialized_result", side_effect=slow_write):
+            result = shadow.run("doc", "attempt", (), b"synthetic", (), (), timeout=0.001)
+        self.assertEqual(result["persistence_status"], "created")
+        self.assertGreaterEqual(result["persistence_duration_ms"], 30)
+        self.assertGreater(result["duration_ms"], 0)
 
     def test_stale_attempt_is_discarded_without_diagnostic(self):
         with patch.dict("os.environ", {"AS400_SHADOW_ENABLED": "true"}), \

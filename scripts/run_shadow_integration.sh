@@ -9,6 +9,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 export AS400_SHADOW_ENABLED=true
+export AS400_SHADOW_PERSISTENCE_ENABLED=false
 export INTEGRATION_TEST_PATTERN=test_shadow_integration.py
 $compose up --build --scale worker=2 -d app worker
 
@@ -22,12 +23,12 @@ while test "$(docker inspect --format '{{.State.Health.Status}}' "$app_container
     fi
     sleep 1
 done
-docker exec "$app_container" python -c 'import os; assert "DATABASE_MIGRATION_URL" not in os.environ and "DATABASE_ADMIN_URL" not in os.environ'
+docker exec "$app_container" python -c 'import os; assert "DATABASE_MIGRATION_URL" not in os.environ and "DATABASE_ADMIN_URL" not in os.environ; assert os.getenv("AS400_SHADOW_PERSISTENCE_ENABLED") == "false"'
 
 workers="$($compose ps -q worker)"
 count=0
 for container in $workers; do
-    docker exec "$container" python -c 'import os; assert os.getenv("AS400_SHADOW_ENABLED") == "true"; assert "DATABASE_MIGRATION_URL" not in os.environ and "DATABASE_ADMIN_URL" not in os.environ'
+    docker exec "$container" python -c 'import os; assert os.getenv("AS400_SHADOW_ENABLED") == "true"; assert os.getenv("AS400_SHADOW_PERSISTENCE_ENABLED") == "false"; assert "DATABASE_MIGRATION_URL" not in os.environ and "DATABASE_ADMIN_URL" not in os.environ'
     count=$((count + 1))
 done
 test "$count" -eq 2
