@@ -127,6 +127,24 @@ class StructuredExtractionTests(unittest.TestCase):
         self.assertEqual(run["status"], "failed")
         self.assertEqual(document["status"], "indexed")
 
+    def test_shadow_failure_does_not_fail_generic_extraction_or_redownload_pdf(self):
+        from domain.structured_extraction import PDFPage
+
+        data = b"synthetic pdf bytes already loaded by ingestion"
+        with patch("application.structured_extraction.extract_pdf", return_value=(
+                PDFPage(1, 612, 792, "Synthetic invoice"),)), \
+             patch("application.structured_extraction.get_object") as get_object, \
+             patch("application.shadow_extraction.run", side_effect=RuntimeError("sensitive value")):
+            run_id = extract_document("invoice-1", db_path=self.db_path, data=data, attempt_id="attempt-1")
+
+        get_object.assert_not_called()
+        with closing(jobstore.connect(self.db_path)) as db:
+            run = db.execute("SELECT status,extractor_version FROM extraction_runs WHERE id=?", (run_id,)).fetchone()
+            document = db.execute("SELECT status FROM jobs WHERE id='invoice-1'").fetchone()
+        self.assertEqual(run["status"], "succeeded")
+        self.assertEqual(run["extractor_version"], "generic-invoice@1")
+        self.assertEqual(document["status"], "indexed")
+
     def test_generic_extractor_extracts_only_evidenced_values(self):
         pdf = synthetic_pdf([["Factura: F-2026/14", "Fecha: 3/9/2026",
                               "Emisor CIF: B12345678", "Cliente CIF: A1234567B",

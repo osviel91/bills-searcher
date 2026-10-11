@@ -43,6 +43,8 @@ services:
       JOB_HEARTBEAT_SECONDS: "2"
       GENERATION_RETENTION_SECONDS: "86400"
       PHASE0C_INTEGRATION: "1"
+      AS400_SHADOW_ENABLED: ${AS400_SHADOW_ENABLED:-false}
+      INTEGRATION_TEST_PATTERN: ${INTEGRATION_TEST_PATTERN:-test_phase0c_integration.py}
       AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
       AZURE_STORAGE_CONTAINER: bills-integration
     ports: !reset []
@@ -69,7 +71,7 @@ services:
 
   integration-tests:
     build: .
-    command: sh -c 'touch /integration-hooks/pause-claiming && touch /integration-hooks/workers-start && python -m unittest discover -s tests -p test_phase0c_integration.py -v'
+    command: sh -c 'touch /integration-hooks/pause-claiming && touch /integration-hooks/workers-start && python -m unittest discover -s tests -p "$${INTEGRATION_TEST_PATTERN}" -v'
     environment:
       <<: *integration-env
       APP_URL: http://app:8000

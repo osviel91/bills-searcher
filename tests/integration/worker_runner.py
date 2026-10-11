@@ -1,17 +1,55 @@
 import json
+import logging
+import multiprocessing
 import os
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import worker
+from application import shadow_extraction
+import shadow_fixtures
 
 
 job = json.loads(os.environ["PHASE0C_JOB"])
 hook_dir = Path(os.environ["PHASE0C_HOOK_DIR"])
 claimed_path = hook_dir / "hook-claimed.json"
+
+expected_shadow = os.getenv("SHADOW_EXPECT_ENABLED", os.getenv("AS400_SHADOW_ENABLED", "false")) == "true"
+if shadow_extraction.enabled() != expected_shadow:
+    raise RuntimeError("shadow runner configuration mismatch")
+
+if os.getenv("SHADOW_TEST_MODE"):
+    mode = os.environ["SHADOW_TEST_MODE"]
+    original_run_isolated = shadow_extraction._run_isolated
+
+    def run_test_child(_target, args, timeout):
+        target = getattr(shadow_fixtures, f"child_{mode}")
+        return original_run_isolated(target, (str(hook_dir),), timeout)
+
+    shadow_extraction._run_isolated = run_test_child
+
+
+class DiagnosticCapture:
+    def emit(self, record):
+        diagnostic = getattr(record, "as400_shadow", None)
+        if diagnostic is None:
+            return
+        safe = {key: diagnostic[key] for key in (
+            "status", "template", "abstention", "detector_version", "extractor_versions",
+            "fields_produced", "lines_produced", "warnings", "duration_ms", "comparison",
+            "error_type",
+        ) if key in diagnostic}
+        (hook_dir / f"diagnostic-{job['id']}.json").write_text(json.dumps(safe))
+
+
+capture = logging.Handler()
+capture.emit = DiagnosticCapture().emit
+shadow_extraction.LOGGER.addHandler(capture)
+shadow_extraction.LOGGER.setLevel(logging.INFO)
 
 
 def stage_hook(stage, phase="before", **details):
@@ -36,4 +74,7 @@ def stage_hook(stage, phase="before", **details):
             time.sleep(0.02)
 
 
-worker.process(job, stage_hook=stage_hook)
+if __name__ == "__main__":
+    worker.process(job, stage_hook=stage_hook)
+    (hook_dir / f"runner-complete-{job['id']}.json").write_text(
+        json.dumps({"active_children": len(multiprocessing.active_children())}))

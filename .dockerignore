@@ -6,6 +6,7 @@ __pycache__/
 scripts/*
 !scripts/evaluate_extraction.py
 !scripts/extraction_evaluation.py
+!scripts/template_evaluation.py
 garage.toml
 evidence-evaluation.json
 .evidence-evaluation-*.tmp

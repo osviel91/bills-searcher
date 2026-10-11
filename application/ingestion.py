@@ -134,7 +134,7 @@ def process(job, stage_hook=None, *, db_path=None):
     if status == "indexed" and content_type == "application/pdf":
         try:
             from application.structured_extraction import extract_document
-            extract_document(job["id"], db_path=db_path)
+            extract_document(job["id"], db_path=db_path, data=data, attempt_id=attempt_id)
         except Exception:
             logging.exception("Structured extraction failed for document %s", job["id"])
 
