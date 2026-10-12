@@ -1,9 +1,10 @@
 services:
   postgres:
     image: postgres:17-alpine
-    env_file:
-      - path: .env.migration
-        required: false
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set from .env.migration}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set from .env.migration}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set from .env.migration}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -17,7 +18,7 @@ services:
     command: python migrate_schema.py
     env_file:
       - path: .env.migration
-        required: false
+        required: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -43,7 +44,7 @@ services:
       - path: .env
         required: false
       - path: .env.runtime.app
-        required: false
+        required: true
     ports:
       - "${APP_BIND_ADDRESS:-127.0.0.1}:8080:8000"
     volumes:
@@ -68,7 +69,7 @@ services:
       - path: .env
         required: false
       - path: .env.runtime.app
-        required: false
+        required: true
     depends_on:
       schema-migrate:
         condition: service_completed_successfully

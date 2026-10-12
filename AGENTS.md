@@ -1,10 +1,10 @@
 # Agent Instructions
 
 - This is a single Python 3.12 app, not a package workspace. `app.py` serves the FastAPI/MCP API; `worker.py` claims queued jobs, extracts/embeds files, and indexes them. Supporting boundaries are `jobstore.py` (PostgreSQL, with SQLite fallback for local tests), `object_store.py`, `embeddings.py`, and `storage.py` (Elasticsearch).
-- Run deterministic tests with `docker compose run --rm --no-deps app python -m unittest discover -s tests -v`. Focus one test file with `-p 'test_jobstore.py'` (replace with the relevant filename). `scripts/smoke_search.py` and `scripts/evaluate_search.py` call a live service; evaluation requires a human-labeled JSON case file. No lint or typecheck command is configured.
+- Run deterministic tests with `docker compose --env-file .env --env-file .env.migration run --rm --no-deps app python -m unittest discover -s tests -v`. Focus one test file with `-p 'test_jobstore.py'` (replace with the relevant filename). `scripts/smoke_search.py` and `scripts/evaluate_search.py` call a live service; evaluation requires a human-labeled JSON case file. No lint or typecheck command is configured.
 - Compose uses `.env`, `.env.runtime.app` (from `.env.runtime.example`) and `.env.migration` (from `.env.migration.example`). The migration URL/admin credentials are only for PostgreSQL and the one-shot `schema-migrate` service, never API/worker; `DATABASE_URL` must use the separate runtime role. Keep credentials out of source control. Do not send real invoices to an embedding endpoint until its location and data controls are verified; use synthetic/anonymous documents for remote endpoints.
 - Embedding model, provider, document mode, and vector dimensions must agree with the Elasticsearch index mapping. Changing model/dimensions requires a new index and reindexing; the app rejects a dimension mismatch.
-- `docker compose down -v` deletes local PostgreSQL, Azurite, and Elasticsearch data. The README is the source for setup, API, and deployment details; `docker-compose.portainer.yml` is for Portainer deployment, not local testing.
+- `docker compose --env-file .env --env-file .env.migration down -v` deletes local PostgreSQL, Azurite, and Elasticsearch data. The README is the source for setup, API, and deployment details; `docker-compose.portainer.yml` is for Portainer deployment, not local testing.
 
 ## Software Docs architecture
 

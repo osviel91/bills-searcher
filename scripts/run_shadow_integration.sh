@@ -2,7 +2,7 @@
 set -eu
 
 project="bills-shadow-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
-compose="docker compose -f docker-compose.yml -f docker-compose.integration.yml -p $project"
+compose="docker compose --env-file .env --env-file .env.migration -f docker-compose.yml -f docker-compose.integration.yml -p $project"
 cleanup() {
     $compose down --volumes --remove-orphans
 }

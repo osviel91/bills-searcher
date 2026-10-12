@@ -3,14 +3,14 @@
 Run from the repository root:
 
 ```sh
-docker compose run --rm --no-deps -v "$PWD:/app" app \
+docker compose --env-file .env --env-file .env.migration run --rm --no-deps -v "$PWD:/app" app \
   python -m scripts.evaluate_extraction evaluation/structured-extraction-v1.json
 ```
 
 Optional report paths:
 
 ```sh
-docker compose run --rm --no-deps -v "$PWD:/app" app \
+docker compose --env-file .env --env-file .env.migration run --rm --no-deps -v "$PWD:/app" app \
   python -m scripts.evaluate_extraction evaluation/structured-extraction-v1.json \
   --json /tmp/extraction-report.json --markdown /tmp/extraction-report.md
 ```
@@ -43,7 +43,7 @@ abstain as `unknown`.
 TEMPLATE_GOLD="$HOME/.local/share/bills-searcher/template-evaluation/gold-v1.json"
 AUTHORIZED_PDFS="/path/to/authorized-pdfs"
 
-docker compose run --rm --no-deps -v "$PWD:/app" \
+docker compose --env-file .env --env-file .env.migration run --rm --no-deps -v "$PWD:/app" \
   -v "$AUTHORIZED_PDFS:/samples:ro" \
   -v "$TEMPLATE_GOLD:/private/gold-v1.json:ro" app \
   python -m scripts.evaluate_templates /private/gold-v1.json /samples \

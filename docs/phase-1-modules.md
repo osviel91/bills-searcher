@@ -10,6 +10,6 @@
 
 ## Compatibility and checks
 
-REST paths, request/response models, MCP tool names and schemas, worker command, Compose services and the PostgreSQL/lease/generation protocol are unchanged. The deterministic test suite remains `docker compose run --build --rm --no-deps app python -m unittest discover -s tests -v`; the isolated real-service suite is `./scripts/run_integration.sh`.
+REST paths, request/response models, MCP tool names and schemas, worker command, Compose services and the PostgreSQL/lease/generation protocol are unchanged. The deterministic test suite is `docker compose --env-file .env --env-file .env.migration run --build --rm --no-deps app python -m unittest discover -s tests -v`; the isolated real-service suite is `./scripts/run_integration.sh`.
 
 The Software Docs shared overview still names the pre-modularization root files. It was intentionally left unchanged under the Fase 1 restriction against shared-resource edits; update it only with explicit authorization.

@@ -14,10 +14,10 @@ Jina local envía PDFs como base64 junto con un `document_id`, e imágenes PNG/J
 
 ## Ejecución
 
-1. Copiar `.env.example` a `.env`, `.env.runtime.example` a `.env.runtime.app` y `.env.migration.example` a `.env.migration`. Usa contraseñas diferentes para `APP_DB_PASSWORD` y `POSTGRES_PASSWORD`; la contraseña del `DATABASE_URL` debe coincidir con `APP_DB_PASSWORD`. `.env.migration` contiene el URL admin y solo se monta en PostgreSQL y `schema-migrate`, nunca en API/worker. Configurar `EMBEDDING_API_KEY` sin versionar los archivos.
+1. Copiar `.env.example` a `.env`, `.env.runtime.example` a `.env.runtime.app` y `.env.migration.example` a `.env.migration`. Usa contraseñas diferentes para `APP_DB_PASSWORD` y `POSTGRES_PASSWORD`; la contraseña del `DATABASE_URL` debe coincidir con `APP_DB_PASSWORD`. El URL admin solo se entrega a `schema-migrate`; PostgreSQL recibe las variables `POSTGRES_*` necesarias, nunca URLs de conexión ni la contraseña runtime. API/worker reciben solo `.env.runtime.app`. Configurar `EMBEDDING_API_KEY` sin versionar los archivos.
 2. Para Jina local en el host, configura `EMBEDDING_PROVIDER=jina-local`, `EMBEDDING_BASE_URL=http://host.docker.internal:8000/v1`, `EMBEDDING_MODEL=jinaai/jina-embeddings-v5-omni-nano`, `EMBEDDING_DOCUMENT_MODE=direct` y `EMBEDDING_DIMENSIONS=768`. En Ajustes elige Jina y modo multimodal directo. Otros proveedores requieren modo texto.
 3. Cambiar de modelo/dimensiones requiere un índice Elasticsearch nuevo y reindexar documentos. El ejemplo usa `invoices-poc-jina-omni-v5-768`; la aplicación rechaza un índice cuyo vector no coincide con `EMBEDDING_DIMENSIONS`.
-4. Ejecuta `docker compose up --build` y abre `http://127.0.0.1:8080`. `schema-migrate` crea/actualiza esquema y aprovisiona el usuario runtime antes de API/workers. Elasticsearch y Azurite se ejecutan localmente para desarrollo; PostgreSQL guarda la cola y Azurite los PDFs originales.
+4. Ejecuta `docker compose --env-file .env --env-file .env.migration up --build` y abre `http://127.0.0.1:8080`. `schema-migrate` crea/actualiza esquema y aprovisiona el usuario runtime antes de API/workers. Elasticsearch y Azurite se ejecutan localmente para desarrollo; PostgreSQL guarda la cola y Azurite los PDFs originales.
 5. En modo directo se admiten PDFs y PNG/JPEG/WEBP; en modo texto, PDFs con texto extraíble. Buscar conceptos y abrir los originales desde los resultados.
 
 La subida acepta una firma `%PDF-` dentro de los primeros 1024 bytes, para archivos con preámbulo MIME corto; guarda solo desde la firma. La API devuelve un resultado por fichero (`queued`, `duplicate` o `rejected`) para que un archivo inválido no cancele el resto del bloque. `MAX_UPLOAD_MB` se aplica a cada archivo y `MAX_BATCH_FILES` limita el número por petición. La interfaz muestra el envío, los errores HTTP y páginas de 50 documentos.
@@ -52,9 +52,9 @@ La extracción AS/400 Shadow es opcional (`AS400_SHADOW_ENABLED=false` por defec
 
 ## Diagnóstico y datos
 
-`docker compose` publica la aplicación y Elasticsearch solo en loopback por defecto. Para acceso desde otro host, pon la API detrás de un proxy HTTPS/firewall y configura `APP_BIND_ADDRESS` según dónde se ejecute el proxy. Elasticsearch usa 1 GiB de heap en desarrollo; modelo e inferencia se ejecutan en servicios externos. Los trabajos viven en PostgreSQL; en desarrollo los PDFs persisten en Azurite y en producción en Azure Blob Storage. `docker compose down -v` elimina los datos locales de PostgreSQL, Azurite y Elasticsearch.
+`docker compose` publica la aplicación y Elasticsearch solo en loopback por defecto. Para acceso desde otro host, pon la API detrás de un proxy HTTPS/firewall y configura `APP_BIND_ADDRESS` según dónde se ejecute el proxy. Elasticsearch usa 1 GiB de heap en desarrollo; modelo e inferencia se ejecutan en servicios externos. Los trabajos viven en PostgreSQL; en desarrollo los PDFs persisten en Azurite y en producción en Azure Blob Storage. Para detener sin borrar datos usa `docker compose --env-file .env --env-file .env.migration down`. `down -v` con esos mismos archivos elimina los volúmenes locales de PostgreSQL, Azurite y Elasticsearch.
 
-Los workers se pueden distribuir en el mismo servidor con `docker compose up --build --scale worker=4`; PostgreSQL reclama cada trabajo de forma atómica para evitar que dos workers lo procesen a la vez. Cada tarea en `processing` tiene una lease temporal y se vuelve a encolar si el worker no la completa en una hora. Azurite es solo para desarrollo local; producción usa la cuenta externa de Azure Blob Storage.
+Los workers se pueden distribuir en el mismo servidor con `docker compose --env-file .env --env-file .env.migration up --build --scale worker=4`; PostgreSQL reclama cada trabajo de forma atómica para evitar que dos workers lo procesen a la vez. Cada tarea en `processing` tiene una lease temporal y se vuelve a encolar si el worker no la completa en una hora. Azurite es solo para desarrollo local; producción usa la cuenta externa de Azure Blob Storage.
 
 El diagnóstico `/api/health` comprueba Elasticsearch, PostgreSQL, almacenamiento de objetos y la lista de modelos del proveedor, sin generar vectores. Se procesaron las seis facturas indicadas por el usuario: las seis quedaron `indexed`. Una regresión con consulta de frase y código de cliente, cuyo resultado relevante se confirmó con el usuario, pasó a posición 1 (Recall@5 y Recall@10: 1.0). También se validó el flujo extremo a extremo con un PDF sintético. La métrica cubre un único caso etiquetado; no es una evaluación representativa del corpus.
 
@@ -63,13 +63,13 @@ El diagnóstico `/api/health` comprueba Elasticsearch, PostgreSQL, almacenamient
 Pruebas deterministas (sin enviar datos al proveedor):
 
 ```sh
-docker compose run --rm --no-deps app python -m unittest discover -s tests -v
+docker compose --env-file .env --env-file .env.migration run --rm --no-deps app python -m unittest discover -s tests -v
 ```
 
 La evaluación offline de extracción estructurada usa exclusivamente PDFs sintéticos/anonimizados y no llama servicios externos:
 
 ```sh
-docker compose run --rm --no-deps -v "$PWD:/app" app \
+docker compose --env-file .env --env-file .env.migration run --rm --no-deps -v "$PWD:/app" app \
   python -m scripts.evaluate_extraction evaluation/structured-extraction-v1.json
 ```
 
