@@ -66,6 +66,46 @@ Pruebas deterministas (sin enviar datos al proveedor):
 docker compose --env-file .env --env-file .env.migration run --rm --no-deps app python -m unittest discover -s tests -v
 ```
 
+## Pruebas de integración Docker
+
+Los runners crean un proyecto Compose único (`bills-phase0c-<uuid>` o `bills-shadow-<uuid>`), con redes y volúmenes propios, sin puertos publicados ni dependencia del Jina externo. Al terminar, tanto con éxito como con error, guardan salida y logs en `$HOME/Library/Application Support/BillsSearcher/test-runs/<project>.log` con permisos restrictivos y eliminan solo los recursos de ese proyecto. Se puede cambiar la ruta con `BILLS_TEST_ARTIFACTS_DIR`. No ejecutan prune global. Las imágenes locales creadas por el proyecto se retiran con `down --rmi local`.
+
+```sh
+./scripts/run_integration.sh
+./scripts/run_shadow_integration.sh
+```
+
+Para conservar temporalmente el entorno cuando la prueba falla, pasar `--keep-on-failure`:
+
+```sh
+./scripts/run_integration.sh --keep-on-failure
+./scripts/run_shadow_integration.sh --keep-on-failure
+```
+
+El runner informa el ID del proyecto, la ruta del log y el comando exacto de limpieza. Tras un `SIGKILL`, apagado de Docker o caída del host no se ejecutan traps: obtiene el ID exacto del log o de los labels Compose y verifica recursos antes de limpiar:
+
+```sh
+project=bills-phase0c-REPLACE_WITH_EXACT_ID
+docker ps -a --filter "label=com.docker.compose.project=$project"
+docker network ls --filter "label=com.docker.compose.project=$project"
+docker volume ls --filter "label=com.docker.compose.project=$project"
+docker compose --env-file .env --env-file .env.migration \
+  -f docker-compose.yml -f docker-compose.integration.yml -p "$project" \
+  logs --no-color >> "$HOME/Library/Application Support/BillsSearcher/test-runs/$project.log" 2>&1
+docker compose --env-file .env --env-file .env.migration \
+  -f docker-compose.yml -f docker-compose.integration.yml -p "$project" \
+  down --rmi local --volumes --remove-orphans
+```
+
+Comprueba el ID exacto antes de limpiar. Este comando solo elimina contenedores, red, volúmenes e imágenes locales etiquetados por ese proyecto; no uses `docker system prune` ni `docker volume prune`.
+
+Para aislar una prueba de una suite, `INTEGRATION_TEST_PATTERN` selecciona el archivo unittest e `INTEGRATION_TEST_FILTER` aplica el filtro estándar `unittest -k` (por defecto `test_`):
+
+```sh
+INTEGRATION_TEST_FILTER=test_00_api_to_two_workers_to_search_and_evidence \
+  ./scripts/run_integration.sh
+```
+
 La evaluación offline de extracción estructurada usa exclusivamente PDFs sintéticos/anonimizados y no llama servicios externos:
 
 ```sh
