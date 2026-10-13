@@ -26,6 +26,8 @@ services:
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:3.35.0
     command: azurite-blob --blobHost 0.0.0.0 --location /data --skipApiVersionCheck
+    environment:
+      AZURITE_ACCOUNTS: ${AZURITE_ACCOUNT_NAME:?Set AZURITE_ACCOUNT_NAME}:${AZURITE_ACCOUNT_KEY:?Set AZURITE_ACCOUNT_KEY}
     volumes:
       - azurite-data:/data
     healthcheck:
@@ -38,7 +40,7 @@ services:
     build: .
     command: uvicorn app:app --host 0.0.0.0 --port 8000
     environment:
-      AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=${AZURITE_ACCOUNT_NAME:?Set AZURITE_ACCOUNT_NAME};AccountKey=${AZURITE_ACCOUNT_KEY:?Set AZURITE_ACCOUNT_KEY};BlobEndpoint=http://azurite:10000/${AZURITE_ACCOUNT_NAME};"
       AZURE_STORAGE_CONTAINER: invoice-pdfs
     env_file:
       - path: .env
@@ -63,7 +65,7 @@ services:
     volumes:
       - embedding-settings-data:/data
     environment:
-      AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=${AZURITE_ACCOUNT_NAME:?Set AZURITE_ACCOUNT_NAME};AccountKey=${AZURITE_ACCOUNT_KEY:?Set AZURITE_ACCOUNT_KEY};BlobEndpoint=http://azurite:10000/${AZURITE_ACCOUNT_NAME};"
       AZURE_STORAGE_CONTAINER: invoice-pdfs
     env_file:
       - path: .env

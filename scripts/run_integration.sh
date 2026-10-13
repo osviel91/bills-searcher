@@ -13,6 +13,11 @@ if [ "$#" -gt 1 ]; then
 fi
 
 project="bills-phase0c-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+azurite_credentials="$(python3 -c 'import base64, secrets, uuid; print(f"bills{uuid.uuid4().hex[:12]}:{base64.b64encode(secrets.token_bytes(64)).decode()}")')"
+AZURITE_ACCOUNT_NAME=${azurite_credentials%%:*}
+AZURITE_ACCOUNT_KEY=${azurite_credentials#*:}
+export AZURITE_ACCOUNT_NAME AZURITE_ACCOUNT_KEY
+unset azurite_credentials
 compose="docker compose --env-file .env --env-file .env.migration -f docker-compose.yml -f docker-compose.integration.yml -p $project"
 artifact_dir=${BILLS_TEST_ARTIFACTS_DIR:-"$HOME/Library/Application Support/BillsSearcher/test-runs"}
 (umask 077 && mkdir -p "$artifact_dir")

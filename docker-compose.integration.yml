@@ -56,7 +56,7 @@ services:
       AS400_SHADOW_ENABLED: ${AS400_SHADOW_ENABLED:-false}
       AS400_SHADOW_PERSISTENCE_ENABLED: ${AS400_SHADOW_PERSISTENCE_ENABLED:-false}
       INTEGRATION_TEST_PATTERN: ${INTEGRATION_TEST_PATTERN:-test_phase0c_integration.py}
-      AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=${AZURITE_ACCOUNT_NAME:?Set AZURITE_ACCOUNT_NAME};AccountKey=${AZURITE_ACCOUNT_KEY:?Set AZURITE_ACCOUNT_KEY};BlobEndpoint=http://azurite:10000/${AZURITE_ACCOUNT_NAME};"
       AZURE_STORAGE_CONTAINER: bills-integration
     ports: !reset []
     volumes: !override
