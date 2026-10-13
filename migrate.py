@@ -3,10 +3,10 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from jobstore import connect
-from object_store import ensure_container, put
+from infrastructure.jobstore import connect
+from infrastructure.object_store import ensure_container, put
 from elasticsearch.helpers import scan
-from storage import INDEX, client as elasticsearch
+from infrastructure.storage import INDEX, client as elasticsearch
 
 LEGACY_DB = Path(os.getenv("LEGACY_DB", "/legacy/jobs.sqlite3"))
 

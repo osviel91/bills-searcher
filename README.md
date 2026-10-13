@@ -14,10 +14,18 @@ Jina local envía PDFs como base64 junto con un `document_id`, e imágenes PNG/J
 
 ## Ejecución
 
-1. Copiar `.env.example` a `.env` y `.env.runtime.example` a `.env.runtime`. Reemplazar los secretos de API y PostgreSQL por valores aleatorios; la contraseña incluida en `DATABASE_URL` debe coincidir con `POSTGRES_PASSWORD`. Configurar `EMBEDDING_API_KEY` sin versionar los archivos.
+1. Copiar `.env.example` a `.env`, `.env.runtime.example` a `.env.runtime.app` y `.env.migration.example` a `.env.migration`. Usa contraseñas diferentes para `APP_DB_PASSWORD` y `POSTGRES_PASSWORD`; la contraseña del `DATABASE_URL` debe coincidir con `APP_DB_PASSWORD`. El URL admin solo se entrega a `schema-migrate`; PostgreSQL recibe las variables `POSTGRES_*` necesarias, nunca URLs de conexión ni la contraseña runtime. API/worker reciben solo `.env.runtime.app`. Configurar `EMBEDDING_API_KEY` sin versionar los archivos.
 2. Para Jina local en el host, configura `EMBEDDING_PROVIDER=jina-local`, `EMBEDDING_BASE_URL=http://host.docker.internal:8000/v1`, `EMBEDDING_MODEL=jinaai/jina-embeddings-v5-omni-nano`, `EMBEDDING_DOCUMENT_MODE=direct` y `EMBEDDING_DIMENSIONS=768`. En Ajustes elige Jina y modo multimodal directo. Otros proveedores requieren modo texto.
 3. Cambiar de modelo/dimensiones requiere un índice Elasticsearch nuevo y reindexar documentos. El ejemplo usa `invoices-poc-jina-omni-v5-768`; la aplicación rechaza un índice cuyo vector no coincide con `EMBEDDING_DIMENSIONS`.
-4. Ejecuta `docker compose up --build` y abre `http://127.0.0.1:8080`. Elasticsearch y Azurite se ejecutan localmente para desarrollo; PostgreSQL guarda la cola y Azurite los PDFs originales.
+4. Configura una cuenta propia para el Azurite local, sin usar su cuenta/clave predeterminadas. Antes de iniciar Compose, genera variables para esa shell:
+
+   ```sh
+   export AZURITE_ACCOUNT_NAME=billslocal
+   export AZURITE_ACCOUNT_KEY="$(python3 -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(64)).decode())')"
+   docker compose --env-file .env --env-file .env.migration up --build
+   ```
+
+   No guardes la clave en archivos versionados; si la persistes en `.env` para reutilizarla, ese archivo ya está ignorado por Git. `schema-migrate` crea/actualiza esquema y aprovisiona el usuario runtime antes de API/workers. Elasticsearch y Azurite se ejecutan localmente para desarrollo; PostgreSQL guarda la cola y Azurite los PDFs originales. Los runners de integración generan credenciales efímeras independientes para cada proyecto desechable.
 5. En modo directo se admiten PDFs y PNG/JPEG/WEBP; en modo texto, PDFs con texto extraíble. Buscar conceptos y abrir los originales desde los resultados.
 
 La subida acepta una firma `%PDF-` dentro de los primeros 1024 bytes, para archivos con preámbulo MIME corto; guarda solo desde la firma. La API devuelve un resultado por fichero (`queued`, `duplicate` o `rejected`) para que un archivo inválido no cancele el resto del bloque. `MAX_UPLOAD_MB` se aplica a cada archivo y `MAX_BATCH_FILES` limita el número por petición. La interfaz muestra el envío, los errores HTTP y páginas de 50 documentos.
@@ -30,7 +38,9 @@ Swagger UI está disponible en `/api/docs`, la especificación OpenAPI en `/api/
 
 La API REST acepta PDFs e imágenes compatibles como `multipart/form-data` en `POST /api/documents`, usando el campo repetido `files`. Las imágenes se validan como PNG/JPEG/WEBP y requieren Jina en modo directo. Devuelve identificadores para consultar individualmente `GET /api/documents/{id}`. El listado admite `limit` (1-200), `offset` y filtro `status`. La búsqueda de facturas es `POST /api/search`; la recuperación de pasajes de evidencia es `POST /api/search/evidence` con `{query, limit, invoice_id?}`, y los filtros estructurados se envían a `POST /api/invoices/filter` como JSON con campos de factura, cliente, fechas e intervalo de total a pagar.
 
-La interfaz web permite alternar entre facturas, pasajes de evidencia y filtros estructurados. Los pasajes muestran offsets sobre texto extraído (no páginas del PDF), score relativo y acceso al original. Los resultados filtrados incluyen la confianza heurística y la evidencia textual disponibles; estos campos no constituyen verificación contable. La interfaz presenta evidencia, pero no genera respuestas: esa responsabilidad corresponde al agente que consume MCP.
+La interfaz web permite alternar entre facturas, pasajes de evidencia, filtros estructurados y evaluación. Los pasajes muestran offsets sobre texto extraído (no páginas del PDF), score relativo y acceso al original. Los resultados filtrados incluyen la confianza heurística y la evidencia textual disponibles; estos campos no constituyen verificación contable. La interfaz presenta evidencia, pero no genera respuestas: esa responsabilidad corresponde al agente que consume MCP.
+
+La pestaña **Evaluación** guarda los casos etiquetados en `DATA_DIR/evidence-evaluation.json`, permite inspeccionar el texto extraído y añadir citas revisadas manualmente, y ejecuta Recall@5/10 en el backend. Informa por separado (1) resolución de factura en la búsqueda de documentos, (2) recuperación global de pasajes y (3) recuperación de pasajes condicionada por los `invoice_id` gold. La tercera métrica es diagnóstica/oráculo: mide recuperación dentro de la factura una vez conocida, no Recall end-to-end. Los contratos REST son `GET/PUT /api/evaluation/evidence/cases`, `POST /api/evaluation/evidence/run` y `GET /api/documents/{id}/text`. El archivo contiene consultas e incluso citas de facturas: queda en el volumen local `DATA_DIR`, protegido por Bearer en la API; protege también los permisos y las copias de seguridad del volumen. La UI no marca resultados recuperados como relevantes automáticamente.
 
 El servidor MCP usa Streamable HTTP en `/mcp` y publica `index_invoice` (un PDF por llamada, codificado en base64), `get_invoice_status`, `reindex_invoices`, `semantic_search`, `search_invoice_evidence` y `filter_invoices`. Para archivos grandes, usa el endpoint REST multipart: el transporte MCP tiene un límite de tamaño de mensaje del SDK, por lo que no debe usarse para PDFs grandes.
 
@@ -38,17 +48,21 @@ Para desplegar detrás de un proxy HTTPS, conserva `APP_BIND_ADDRESS=127.0.0.1` 
 
 ### Portainer
 
-Despliega `docker-compose.portainer.yml` desde el repositorio Git para que Portainer pueda construir las imágenes desde el `Dockerfile`. Define en las variables del Stack: `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL`, `API_TOKEN`, `ELASTICSEARCH_URL`, `ELASTICSEARCH_INDEX`, `AZURE_STORAGE_CONNECTION_STRING`, `AZURE_STORAGE_CONTAINER`, `EMBEDDING_PROVIDER`, `EMBEDDING_DOCUMENT_MODE`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`, y las claves opcionales de Elasticsearch/embeddings. Para Jina Omni v5 usa un índice nuevo con `EMBEDDING_DIMENSIONS=768`; la dimensión debe coincidir con la mapping del índice. Usa secretos de Portainer para contraseñas, tokens y connection string. `DATABASE_URL` debe apuntar al servicio `postgres` del stack y su contraseña debe coincidir con `POSTGRES_PASSWORD`. Elasticsearch, Azure Blob y el servicio de embeddings son dependencias externas accesibles desde la red Docker. Configura `APP_BIND_ADDRESS=0.0.0.0` si el proxy no comparte el host; protege entonces el puerto con firewall y TLS en el proxy.
+Despliega `docker-compose.portainer.yml` desde el repositorio Git para que Portainer pueda construir las imágenes desde el `Dockerfile`. Define `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` como credencial administrativa solo de PostgreSQL/migrador; `APP_DB_USER`, `APP_DB_PASSWORD` para el runtime y `DATABASE_MIGRATION_URL` para el servicio one-shot de migración. `DATABASE_URL` debe contener `APP_DB_USER`/`APP_DB_PASSWORD`, y solo se entrega a API/worker. Añade además `API_TOKEN`, `ELASTICSEARCH_URL`, `ELASTICSEARCH_INDEX`, `AZURE_STORAGE_CONNECTION_STRING`, `AZURE_STORAGE_CONTAINER`, `EMBEDDING_PROVIDER`, `EMBEDDING_DOCUMENT_MODE`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL` y las claves opcionales. Para Jina Omni v5 usa un índice nuevo con `EMBEDDING_DIMENSIONS=768`. Usa secretos de Portainer para contraseñas, tokens y connection string. No incluyas `DATABASE_MIGRATION_URL` en el entorno de API/worker. En instalaciones con volumen PostgreSQL preexistente, define y verifica las credenciales runtime nuevas antes de desplegar; no reutilices como `DATABASE_URL` el usuario superuser histórico. Elasticsearch, Azure Blob y embeddings son dependencias externas. Configura `APP_BIND_ADDRESS=0.0.0.0` si el proxy no comparte host y protégelo con firewall/TLS.
 
 La cola transaccional está en PostgreSQL y los originales en Azure Blob Storage; `FOR UPDATE SKIP LOCKED` permite varios workers sin reclamar dos veces un trabajo. La configuración del proveedor se persiste en el volumen compartido `embedding-settings-data` para que app y workers usen el mismo modo.
 
+La API/worker usa el rol `APP_DB_USER`, sin superuser, CREATE de schema, ownership ni membresía en `extraction_retention_operator`. `schema-migrate` usa `DATABASE_MIGRATION_URL` para cambios DDL y aprovisiona el rol runtime con DML mínimo. La retención de runs terminales es una función SECURITY DEFINER propiedad del rol PostgreSQL NOLOGIN `extraction_retention_operator`; un DBA autorizado debe `SET ROLE extraction_retention_operator` y llamar `retire_extraction_run(run_id)`. Triggers exigen tanto el rol efectivo como el marcador transaccional interno de la función. Un GUC solo no concede privilegio. La retención elimina run e hijas en una única transacción; cualquier FK restrictiva revierte todo el borrado.
+
 El worker extrae texto de PDFs digitales con MarkItDown y, mediante reglas deterministas, intenta identificar número/fecha de factura, código y NIF del cliente, albaranes, conceptos, moneda, base imponible, IVA, total de factura y total a pagar. Cada dato extraído incluye evidencia textual y una confianza heurística; los valores ausentes o ambiguos quedan vacíos. Los importes se guardan separados y no implican una decisión sobre qué sumar. El texto se divide en pasajes y se vectoriza por lotes; `search_invoice_evidence` devuelve los pasajes coincidentes con offsets de caracteres sobre el texto extraído (MarkItDown no conserva una ubicación fiable por página). Usa esta herramienta para respuestas fundamentadas en citas. `filter_invoices` permite filtrar por identificadores, conceptos, fechas, moneda e intervalo de total a pagar; `semantic_search` busca facturas completas. Una búsqueda semántica top-K no es exhaustiva y no debe usarse como conjunto para sumar. Ninguna puntuación o confianza es certeza contable. `reindex_invoices` reprocesa una factura por ID o todas las indexadas, necesario para generar pasajes de documentos previos. Antes de marcar una factura como `indexed`, el worker comprueba que todos los pasajes de su generación estén activos; conflictos o publicaciones incompletas dejan el trabajo en `failed`. La limpieza de generaciones inactivas sigue siendo best-effort. La credencial Elasticsearch del servicio necesita gestionar el índice de pasajes y ejecutar consultas de lectura/escritura, `update_by_query` y `delete_by_query` para publicar nuevas generaciones y limpiar fragmentos antiguos.
+
+La extracción AS/400 Shadow es opcional (`AS400_SHADOW_ENABLED=false` por defecto); su persistencia especializada requiere además `AS400_SHADOW_PERSISTENCE_ENABLED=true` y está deshabilitada por defecto. El writer Shadow es experimental, no valida importes y no se conecta a REST/MCP: mantener ambas opciones apagadas en producción hasta completar revisión operativa y funcional. Usa fixtures sintéticos para probarlo.
 
 ## Diagnóstico y datos
 
-`docker compose` publica la aplicación y Elasticsearch solo en loopback por defecto. Para acceso desde otro host, pon la API detrás de un proxy HTTPS/firewall y configura `APP_BIND_ADDRESS` según dónde se ejecute el proxy. Elasticsearch usa 1 GiB de heap en desarrollo; modelo e inferencia se ejecutan en servicios externos. Los trabajos viven en PostgreSQL; en desarrollo los PDFs persisten en Azurite y en producción en Azure Blob Storage. `docker compose down -v` elimina los datos locales de PostgreSQL, Azurite y Elasticsearch.
+`docker compose` publica la aplicación y Elasticsearch solo en loopback por defecto. Para acceso desde otro host, pon la API detrás de un proxy HTTPS/firewall y configura `APP_BIND_ADDRESS` según dónde se ejecute el proxy. Elasticsearch usa 1 GiB de heap en desarrollo; modelo e inferencia se ejecutan en servicios externos. Los trabajos viven en PostgreSQL; en desarrollo los PDFs persisten en Azurite y en producción en Azure Blob Storage. Para detener sin borrar datos usa `docker compose --env-file .env --env-file .env.migration down`. `down -v` con esos mismos archivos elimina los volúmenes locales de PostgreSQL, Azurite y Elasticsearch.
 
-Los workers se pueden distribuir en el mismo servidor con `docker compose up --build --scale worker=4`; PostgreSQL reclama cada trabajo de forma atómica para evitar que dos workers lo procesen a la vez. Cada tarea en `processing` tiene una lease temporal y se vuelve a encolar si el worker no la completa en una hora. Azurite es solo para desarrollo local; producción usa la cuenta externa de Azure Blob Storage.
+Los workers se pueden distribuir en el mismo servidor con `docker compose --env-file .env --env-file .env.migration up --build --scale worker=4`; PostgreSQL reclama cada trabajo de forma atómica para evitar que dos workers lo procesen a la vez. Cada tarea en `processing` tiene una lease temporal y se vuelve a encolar si el worker no la completa en una hora. Azurite es solo para desarrollo local; producción usa la cuenta externa de Azure Blob Storage.
 
 El diagnóstico `/api/health` comprueba Elasticsearch, PostgreSQL, almacenamiento de objetos y la lista de modelos del proveedor, sin generar vectores. Se procesaron las seis facturas indicadas por el usuario: las seis quedaron `indexed`. Una regresión con consulta de frase y código de cliente, cuyo resultado relevante se confirmó con el usuario, pasó a posición 1 (Recall@5 y Recall@10: 1.0). También se validó el flujo extremo a extremo con un PDF sintético. La métrica cubre un único caso etiquetado; no es una evaluación representativa del corpus.
 
@@ -57,8 +71,57 @@ El diagnóstico `/api/health` comprueba Elasticsearch, PostgreSQL, almacenamient
 Pruebas deterministas (sin enviar datos al proveedor):
 
 ```sh
-docker compose run --rm --no-deps app python -m unittest discover -s tests -v
+docker compose --env-file .env --env-file .env.migration run --rm --no-deps app python -m unittest discover -s tests -v
 ```
+
+## Pruebas de integración Docker
+
+Los runners crean un proyecto Compose único (`bills-phase0c-<uuid>` o `bills-shadow-<uuid>`), con redes y volúmenes propios, sin puertos publicados ni dependencia del Jina externo. Al terminar, tanto con éxito como con error, guardan salida y logs en `$HOME/Library/Application Support/BillsSearcher/test-runs/<project>.log` con permisos restrictivos y eliminan solo los recursos de ese proyecto. Se puede cambiar la ruta con `BILLS_TEST_ARTIFACTS_DIR`. No ejecutan prune global. Las imágenes locales creadas por el proyecto se retiran con `down --rmi local`.
+
+```sh
+./scripts/run_integration.sh
+./scripts/run_shadow_integration.sh
+```
+
+Para conservar temporalmente el entorno cuando la prueba falla, pasar `--keep-on-failure`:
+
+```sh
+./scripts/run_integration.sh --keep-on-failure
+./scripts/run_shadow_integration.sh --keep-on-failure
+```
+
+El runner informa el ID del proyecto, la ruta del log y el comando exacto de limpieza. Tras un `SIGKILL`, apagado de Docker o caída del host no se ejecutan traps: obtiene el ID exacto del log o de los labels Compose y verifica recursos antes de limpiar:
+
+```sh
+project=bills-phase0c-REPLACE_WITH_EXACT_ID
+docker ps -a --filter "label=com.docker.compose.project=$project"
+docker network ls --filter "label=com.docker.compose.project=$project"
+docker volume ls --filter "label=com.docker.compose.project=$project"
+docker compose --env-file .env --env-file .env.migration \
+  -f docker-compose.yml -f docker-compose.integration.yml -p "$project" \
+  logs --no-color >> "$HOME/Library/Application Support/BillsSearcher/test-runs/$project.log" 2>&1
+docker compose --env-file .env --env-file .env.migration \
+  -f docker-compose.yml -f docker-compose.integration.yml -p "$project" \
+  down --rmi local --volumes --remove-orphans
+```
+
+Comprueba el ID exacto antes de limpiar. Este comando solo elimina contenedores, red, volúmenes e imágenes locales etiquetados por ese proyecto; no uses `docker system prune` ni `docker volume prune`.
+
+Para aislar una prueba de una suite, `INTEGRATION_TEST_PATTERN` selecciona el archivo unittest e `INTEGRATION_TEST_FILTER` aplica el filtro estándar `unittest -k` (por defecto `test_`):
+
+```sh
+INTEGRATION_TEST_FILTER=test_00_api_to_two_workers_to_search_and_evidence \
+  ./scripts/run_integration.sh
+```
+
+La evaluación offline de extracción estructurada usa exclusivamente PDFs sintéticos/anonimizados y no llama servicios externos:
+
+```sh
+docker compose --env-file .env --env-file .env.migration run --rm --no-deps -v "$PWD:/app" app \
+  python -m scripts.evaluate_extraction evaluation/structured-extraction-v1.json
+```
+
+Escribe `extraction-report.json` y `extraction-report.md` en el directorio actual. Formato del dataset v1 y opciones de salida: `evaluation/README.md`.
 
 Prueba real de humo contra el servicio local y oMLX (envía solo las consultas de ejemplo): `python3 scripts/smoke_search.py`.
 
@@ -74,6 +137,18 @@ Para medir calidad sobre las facturas ya indexadas, crea un JSON con consultas y
 Los filenames anteriores son marcadores de posición, no resultados esperados.
 
 Después, con la aplicación activa, ejecuta `python3 scripts/evaluate_search.py casos.json`. Informa Recall@5/10, latencia, top 10 y puede exigir `expected_top1`. Hay un caso de regresión etiquetado; añade más juicios humanos para medir generalización, no interpretes un único caso como evaluación representativa.
+
+Para evaluar evidencia, etiqueta citas textuales relevantes por `invoice_id` estable y fragmento esperado, no por `passage_id` (cambia con cada generación):
+
+```json
+[
+  {"query": "mantenimiento de impresoras", "relevant_evidence": [
+    {"invoice_id": "ID-de-factura-etiquetada", "quote": "fragmento exacto que respalda la consulta"}
+  ]}
+]
+```
+
+Con `API_TOKEN` disponible en el entorno y la app activa, ejecuta `python3 scripts/evaluate_evidence.py evidencia.json`. El script consulta `/api/search/evidence` y calcula Recall@5/10 sobre citas: un resultado cuenta cuando pertenece a la factura etiquetada y contiene el fragmento esperado (sin distinguir mayúsculas ni espacios). Informa latencia y metadatos del top 10, pero no imprime el contenido de los pasajes. Las etiquetas deben ser juicios humanos; el ejemplo es un marcador, no un resultado esperado.
 
 ## Modos y límites
 

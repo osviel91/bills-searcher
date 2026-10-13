@@ -1,0 +1,105 @@
+services:
+  postgres:
+    env_file: !reset []
+    environment:
+      POSTGRES_USER: integration_admin
+      POSTGRES_PASSWORD: integration-admin-only
+      POSTGRES_DB: bills_integration
+    ports: !reset []
+
+  schema-migrate:
+    env_file: !reset []
+    environment:
+      DATABASE_MIGRATION_URL: postgresql://integration_admin:integration-admin-only@postgres:5432/bills_integration
+      APP_DB_USER: integration_app
+      APP_DB_PASSWORD: integration-app-only
+
+  elasticsearch:
+    environment:
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    ports: !reset []
+    healthcheck:
+      start_period: 3m
+      retries: 30
+
+  embedding-stub:
+    build: .
+    command: python tests/integration/embedding_stub.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/v1/models')"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  app:
+    env_file: !reset []
+    environment: &integration-env
+      DATABASE_URL: postgresql://integration_app:integration-app-only@postgres:5432/bills_integration
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      ELASTICSEARCH_INDEX: bills-phase0c
+      EMBEDDING_BASE_URL: http://embedding-stub:8081/v1
+      EMBEDDING_MODEL: deterministic-test-model
+      EMBEDDING_DIMENSIONS: "16"
+      EMBEDDING_PROVIDER: openai-compatible
+      EMBEDDING_DOCUMENT_MODE: text
+      EMBEDDING_API_KEY: ""
+      ELASTICSEARCH_API_KEY: ""
+      ELASTICSEARCH_USERNAME: ""
+      ELASTICSEARCH_PASSWORD: ""
+      EMBEDDING_TIMEOUT_SECONDS: "10"
+      API_TOKEN: integration-only-token
+      DATA_DIR: /data
+      JOB_LEASE_SECONDS: "30"
+      JOB_HEARTBEAT_SECONDS: "2"
+      GENERATION_RETENTION_SECONDS: "86400"
+      PHASE0C_INTEGRATION: "1"
+      AS400_SHADOW_ENABLED: ${AS400_SHADOW_ENABLED:-false}
+      AS400_SHADOW_PERSISTENCE_ENABLED: ${AS400_SHADOW_PERSISTENCE_ENABLED:-false}
+      INTEGRATION_TEST_PATTERN: ${INTEGRATION_TEST_PATTERN:-test_phase0c_integration.py}
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=${AZURITE_ACCOUNT_NAME:?Set AZURITE_ACCOUNT_NAME};AccountKey=${AZURITE_ACCOUNT_KEY:?Set AZURITE_ACCOUNT_KEY};BlobEndpoint=http://azurite:10000/${AZURITE_ACCOUNT_NAME};"
+      AZURE_STORAGE_CONTAINER: bills-integration
+    ports: !reset []
+    volumes: !override
+      - integration-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/ready')"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    depends_on:
+      embedding-stub:
+        condition: service_healthy
+
+  worker:
+    env_file: !reset []
+    command: python tests/integration/worker_service.py
+    environment:
+      <<: *integration-env
+      PHASE0C_HOOK_DIR: /integration-hooks
+    volumes: !override
+      - integration-data:/data
+      - integration-hooks:/integration-hooks
+
+  integration-tests:
+    build: .
+    command: sh -c 'touch /integration-hooks/pause-claiming && touch /integration-hooks/workers-start && python -m unittest discover -s tests -p "$${INTEGRATION_TEST_PATTERN}" -k "$${INTEGRATION_TEST_FILTER}" -v'
+    environment:
+      <<: *integration-env
+      INTEGRATION_TEST_FILTER: ${INTEGRATION_TEST_FILTER:-test_}
+      DATABASE_ADMIN_URL: postgresql://integration_admin:integration-admin-only@postgres:5432/bills_integration
+      APP_DB_USER: integration_app
+      APP_DB_PASSWORD: integration-app-only
+      APP_URL: http://app:8000
+      PHASE0C_HOOK_DIR: /integration-hooks
+    env_file: !reset []
+    volumes: !override
+      - integration-hooks:/integration-hooks
+    depends_on:
+      app:
+        condition: service_healthy
+      worker:
+        condition: service_started
+
+volumes:
+  integration-data:
+  integration-hooks:

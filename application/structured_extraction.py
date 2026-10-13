@@ -1,0 +1,54 @@
+import uuid
+
+from application.extractor_registry import GENERIC, select_extractor
+from domain.structured_extraction import ExtractionExecution
+from infrastructure.extraction_store import save_execution
+from infrastructure.jobstore import connect
+from infrastructure.object_store import get as get_object
+from infrastructure.pdf_extraction import extract_pdf
+
+def extract_document(document_id: str, *, db_path=None, data=None, attempt_id=None) -> str:
+    with connect(db_path) as db:
+        document = db.execute("SELECT id,object_key FROM jobs WHERE id=?", (document_id,)).fetchone()
+    if not document:
+        raise LookupError(f"Documento no encontrado: {document_id}")
+
+    execution_id = str(uuid.uuid4())
+    try:
+        if not document["object_key"]:
+            raise ValueError("El documento no tiene un original almacenado")
+        data = data if data is not None else get_object(document["object_key"]).readall()
+        pages = extract_pdf(data)
+        extractor, warnings = select_extractor(pages)
+        fields, lines, extraction_warnings = extractor.extract(pages)
+        execution = ExtractionExecution(
+            id=execution_id,
+            document_id=document_id,
+            extractor_version=f"{extractor.id}@{extractor.version}",
+            status="succeeded",
+            pages=pages,
+            fields=fields,
+            lines=lines,
+            warnings=warnings + extraction_warnings,
+        )
+    except Exception as error:
+        execution = ExtractionExecution(
+            id=execution_id,
+            document_id=document_id,
+            extractor_version=f"{GENERIC.id}@{GENERIC.version}",
+            status="failed",
+            error=type(error).__name__,
+        )
+    save_execution(execution, db_path)
+    if execution.status == "succeeded":
+        try:
+            from application.shadow_extraction import run
+            run(document_id, attempt_id, pages, data, fields, lines, db_path=db_path)
+        except Exception as error:
+            import logging
+            logging.getLogger(__name__).warning(
+                "AS/400 shadow extraction diagnostic failed", extra={
+                    "as400_shadow": {"document_id": document_id, "attempt_id": attempt_id,
+                                     "status": "runner_error", "error_type": type(error).__name__}
+                })
+    return execution_id

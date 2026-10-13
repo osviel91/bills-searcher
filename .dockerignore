@@ -1,7 +1,14 @@
 .env
 .env.runtime
+.env.runtime.app
+.env.migration
 .venv/
 __pycache__/
 *.pyc
-scripts/
+scripts/*
+!scripts/evaluate_extraction.py
+!scripts/extraction_evaluation.py
+!scripts/template_evaluation.py
 garage.toml
+evidence-evaluation.json
+.evidence-evaluation-*.tmp

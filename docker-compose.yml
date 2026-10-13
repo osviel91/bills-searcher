@@ -1,10 +1,10 @@
 services:
   postgres:
     image: postgres:17-alpine
-    env_file:
-      - path: .env
-        required: false
-      - path: .env.runtime
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set from .env.migration}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set from .env.migration}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set from .env.migration}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -13,9 +13,21 @@ services:
       timeout: 5s
       retries: 20
 
+  schema-migrate:
+    build: .
+    command: python migrate_schema.py
+    env_file:
+      - path: .env.migration
+        required: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:3.35.0
     command: azurite-blob --blobHost 0.0.0.0 --location /data --skipApiVersionCheck
+    environment:
+      AZURITE_ACCOUNTS: ${AZURITE_ACCOUNT_NAME:?Set AZURITE_ACCOUNT_NAME}:${AZURITE_ACCOUNT_KEY:?Set AZURITE_ACCOUNT_KEY}
     volumes:
       - azurite-data:/data
     healthcheck:
@@ -28,19 +40,20 @@ services:
     build: .
     command: uvicorn app:app --host 0.0.0.0 --port 8000
     environment:
-      AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=${AZURITE_ACCOUNT_NAME:?Set AZURITE_ACCOUNT_NAME};AccountKey=${AZURITE_ACCOUNT_KEY:?Set AZURITE_ACCOUNT_KEY};BlobEndpoint=http://azurite:10000/${AZURITE_ACCOUNT_NAME};"
       AZURE_STORAGE_CONTAINER: invoice-pdfs
     env_file:
       - path: .env
         required: false
-      - path: .env.runtime
+      - path: .env.runtime.app
+        required: true
     ports:
       - "${APP_BIND_ADDRESS:-127.0.0.1}:8080:8000"
     volumes:
       - embedding-settings-data:/data
     depends_on:
-      postgres:
-        condition: service_healthy
+      schema-migrate:
+        condition: service_completed_successfully
       azurite:
         condition: service_healthy
       elasticsearch:
@@ -52,15 +65,16 @@ services:
     volumes:
       - embedding-settings-data:/data
     environment:
-      AZURE_STORAGE_CONNECTION_STRING: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=${AZURITE_ACCOUNT_NAME:?Set AZURITE_ACCOUNT_NAME};AccountKey=${AZURITE_ACCOUNT_KEY:?Set AZURITE_ACCOUNT_KEY};BlobEndpoint=http://azurite:10000/${AZURITE_ACCOUNT_NAME};"
       AZURE_STORAGE_CONTAINER: invoice-pdfs
     env_file:
       - path: .env
         required: false
-      - path: .env.runtime
+      - path: .env.runtime.app
+        required: true
     depends_on:
-      postgres:
-        condition: service_healthy
+      schema-migrate:
+        condition: service_completed_successfully
       azurite:
         condition: service_healthy
       elasticsearch:
