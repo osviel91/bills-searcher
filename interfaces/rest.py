@@ -28,6 +28,7 @@ from application.search import (
     INVOICE_SEARCH_FIELDS,
     ServiceUnavailable,
     reciprocal_rank_fusion,
+    run_invoice_metadata as load_invoice_metadata,
     run_invoice_evidence_search as search_invoice_evidence_service,
     run_invoice_filter as search_invoice_filter,
     run_search as search_invoices,
@@ -276,6 +277,18 @@ class SearchResult(BaseModel):
     evidence: dict = Field(default_factory=dict)
 
 
+class DocumentMetadataResponse(BaseModel):
+    invoice_id: str
+    filename: str
+    status: Literal["indexed"]
+    file_url: str
+    index_record_available: bool
+    metadata_available: bool
+    metadata: dict
+    confidence: dict = Field(default_factory=dict)
+    evidence: dict = Field(default_factory=dict)
+
+
 class SearchResponse(BaseModel):
     results: list[SearchResult]
 
@@ -494,6 +507,24 @@ def document_status(doc_id: str):
     if not row:
         raise HTTPException(404, "Documento no encontrado")
     return dict(row)
+
+
+@app.get("/api/documents/{doc_id}/metadata", dependencies=[Depends(require_token)], tags=["Facturas"],
+         summary="Consultar los metadatos genéricos indexados de una factura",
+         response_model=DocumentMetadataResponse,
+         responses={401: {"model": ApiError, "description": "Bearer token ausente o no válido."},
+                    404: {"model": ApiError, "description": "No existe una factura con ese ID."},
+                    409: {"model": ApiError, "description": "La factura todavía no está indexada."},
+                    503: {"model": ApiError, "description": "El índice de facturas no está disponible."}})
+def document_metadata(doc_id: str):
+    try:
+        return load_invoice_metadata(doc_id)
+    except LookupError as error:
+        raise HTTPException(404, "Documento no encontrado") from error
+    except ValueError as error:
+        raise HTTPException(409, "Documento no indexado") from error
+    except ServiceUnavailable as error:
+        raise HTTPException(503, str(error)) from error
 
 
 @app.get("/api/documents/{doc_id}/text", dependencies=[Depends(require_token)], tags=["Facturas"],
@@ -737,7 +768,12 @@ async function loadSettings(){if(!hasToken())return;const [s,h]=await Promise.al
 document.querySelector('#detect-models').onclick=async()=>{const status=document.querySelector('#settings-status');status.textContent='Detectando modelos…';try{const r=await api('/api/settings/embeddings/models');const d=await r.json();if(!r.ok)throw Error(d.detail);const list=document.querySelector('#embedding-models');list.replaceChildren(...d.models.map(id=>{const option=document.createElement('option');option.value=id;return option}));status.textContent=`${d.models.length} modelos detectados. Selecciónalos o escribe un ID manualmente.`}catch(error){status.textContent=error.message}};
 document.querySelector('#embedding-form').onsubmit=async e=>{e.preventDefault();const status=document.querySelector('#settings-status');const r=await api('/api/settings/embeddings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:document.querySelector('#embedding-provider').value,document_mode:document.querySelector('#embedding-document-mode').value,base_url:document.querySelector('#embedding-url').value,model:document.querySelector('#embedding-model').value,api_key:document.querySelector('#embedding-key').value})});status.textContent=r.ok?'Configuración guardada.':'No se pudo guardar la configuración.';document.querySelector('#embedding-key').value='';loadSettings()};
 async function download(url,name){const r=await api(url);if(!r.ok)return;const link=document.createElement('a');link.href=URL.createObjectURL(await r.blob());link.download=name;link.click();URL.revokeObjectURL(link.href)}
-async function refresh(){if(!hasToken())return;const response=await api(`/api/documents?limit=${pageSize}&offset=${offset}`);if(!response.ok)return;const d=await response.json();total=d.total;const list=document.querySelector('#docs');list.replaceChildren();for(const x of d.documents){const li=el('li','');const a=el('a',x.filename);a.href=`/api/documents/${x.id}/file`;a.onclick=e=>{e.preventDefault();download(a.href,x.filename)};li.append(a,document.createTextNode(` · ${x.status}${x.error?` · ${x.error}`:''} `));if(x.status==='failed'){const b=el('button','Reintentar');b.onclick=()=>api(`/api/documents/${x.id}/retry`,{method:'POST'}).then(refresh);li.append(b)}list.append(li)}document.querySelector('#page').textContent=`${total} documentos · ${total?offset+1:0}-${Math.min(offset+pageSize,total)}`;document.querySelector('#previous').disabled=offset===0;document.querySelector('#next').disabled=offset+pageSize>=total}
+const metadataFields=[['invoice_number','Número de factura'],['invoice_date','Fecha'],['customer_code','Código de cliente'],['customer_tax_id','NIF de cliente'],['delivery_note_ids','Albaranes'],['concepts','Conceptos'],['currency','Moneda'],['total_payable','Total a pagar'],['invoice_total','Total factura'],['tax_base','Base imponible'],['vat','IVA']];
+const metadataText=value=>{if(value==null||value===''||(Array.isArray(value)&&!value.length))return 'No detectado';return Array.isArray(value)?value.map(String).join(', '):typeof value==='object'?JSON.stringify(value):String(value)};
+const metadataStyles=document.createElement('style');metadataStyles.textContent='.metadata-card{margin:12px 0;padding:16px;border:1px solid var(--line);border-radius:10px}.metadata-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:8px}.metadata-field{min-width:0;overflow-wrap:anywhere;padding:10px;border:1px solid var(--line);border-radius:8px}.metadata-field dt{color:var(--muted);font-size:.85rem}.metadata-field dd{margin:3px 0 0}.metadata-field small{display:block;color:var(--muted)}.metadata-card>p{overflow-wrap:anywhere}@media(min-width:640px){.metadata-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}';document.head.append(metadataStyles);
+function renderDocumentMetadata(data,target){target.replaceChildren(el('p',`${data.filename} · ${data.invoice_id}`));if(!data.index_record_available)target.append(el('p','No hay un registro de metadatos en la generación visible.'));else if(!data.metadata_available)target.append(el('p','Documento indexado, pero sin metadatos genéricos disponibles.'));const grid=document.createElement('dl');grid.className='metadata-grid';for(const [name,label] of metadataFields){const field=document.createElement('div');field.className='metadata-field';field.append(el('dt',label));const value=data.metadata?.[name],definition=el('dd',metadataText(value)),confidence=data.confidence?.[name],evidence=data.evidence?.[name];if(confidence!=null)definition.append(el('small',`Confianza heurística: ${confidence}`));field.append(definition);if(evidence!=null&&evidence!==''&&(!Array.isArray(evidence)||evidence.length)){const details=document.createElement('details');details.append(el('summary','Evidencia'),el('p',metadataText(evidence)));field.append(details)}else if(value!=null&&value!==''&&(!Array.isArray(value)||value.length))field.append(el('small','Sin evidencia textual asociada.'));grid.append(field)}target.append(grid,el('p','Extracción heurística: los valores no son validación contable.'),originalLink(data,'Abrir PDF original'))}
+function addMetadataAction(doc){const button=el('button','Ver metadatos');button.type='button';button.setAttribute('aria-expanded','false');const panel=el('div','');panel.className='metadata-card hidden';panel.setAttribute('aria-live','polite');let loaded=false,loading=false;button.onclick=async()=>{const opening=panel.classList.contains('hidden');panel.classList.toggle('hidden',!opening);button.textContent=opening?'Ocultar metadatos':'Ver metadatos';button.setAttribute('aria-expanded',String(opening));if(!opening||loaded||loading)return;loading=true;panel.replaceChildren(el('p','Cargando metadatos…'));try{const response=await api(`/api/documents/${encodeURIComponent(doc.id)}/metadata`),data=await response.json();if(!response.ok)throw Error(data.detail||'No se pudieron cargar los metadatos');renderDocumentMetadata(data,panel);loaded=true}catch(error){panel.replaceChildren(el('p',error.message))}finally{loading=false}};return [button,panel]}
+async function refresh(){if(!hasToken())return;const response=await api(`/api/documents?limit=${pageSize}&offset=${offset}`);if(!response.ok)return;const d=await response.json();const list=document.querySelector('#docs');if(list.querySelector('.metadata-card:not(.hidden)'))return;total=d.total;list.replaceChildren();for(const x of d.documents){const li=el('li','');const a=el('a',x.filename);a.href=`/api/documents/${x.id}/file`;a.onclick=e=>{e.preventDefault();download(a.href,x.filename)};li.append(a,document.createTextNode(` · ${x.status}${x.error?` · ${x.error}`:''} `));if(x.status==='failed'){const b=el('button','Reintentar');b.onclick=()=>api(`/api/documents/${x.id}/retry`,{method:'POST'}).then(refresh);li.append(b)}if(x.status==='indexed')li.append(...addMetadataAction(x));list.append(li)}document.querySelector('#page').textContent=`${total} documentos · ${total?offset+1:0}-${Math.min(offset+pageSize,total)}`;document.querySelector('#previous').disabled=offset===0;document.querySelector('#next').disabled=offset+pageSize>=total}
 document.querySelector('#previous').onclick=()=>{offset=Math.max(0,offset-pageSize);refresh()};document.querySelector('#next').onclick=()=>{offset+=pageSize;refresh()};document.querySelector('#upload').onclick=async()=>{const files=document.querySelector('#files').files;const status=document.querySelector('#upload-status');if(!files.length){status.textContent='Selecciona al menos un PDF.';return}const body=new FormData();for(const f of files)body.append('files',f);status.textContent=`Enviando ${files.length} archivo(s)…`;try{const r=await api('/api/documents',{method:'POST',body});const d=await r.json();if(!r.ok)throw Error(d.detail||'Error al subir');status.textContent=`${d.accepted} en cola, ${d.duplicates} duplicados, ${d.rejected} rechazados.`;refresh()}catch(e){status.textContent=`No se pudo subir: ${e.message}`}};
 document.querySelector('#search').onsubmit=async e=>{e.preventDefault();const list=document.querySelector('#results');const panel=document.querySelector('#results-panel');panel.classList.remove('hidden');list.replaceChildren(el('li','Buscando…'));try{const r=await api('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:document.querySelector('#query').value})});const d=await r.json();list.replaceChildren();if(!r.ok)throw Error(d.detail||'Error en búsqueda');if(!d.results.length)list.append(el('li','No se encontraron facturas.'));for(const x of d.results){const li=el('li','');const a=el('a',x.filename);a.href=x.file_url;a.onclick=ev=>{ev.preventDefault();download(a.href,x.filename)};li.append(a,document.createTextNode(` · relevancia ${x.score.toFixed(4)}`));list.append(li)}}catch(error){list.replaceChildren(el('li',error.message))}};
  const searchForm=document.querySelector('#search'),results=document.querySelector('#results'),resultsPanel=document.querySelector('#results-panel');let searchMode='semantic',filterOffset=0,filterPayload={};

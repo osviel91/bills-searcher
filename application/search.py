@@ -1,16 +1,18 @@
 import os
+from contextlib import closing
 from pathlib import Path
 
 from infrastructure.embeddings import embed
-from infrastructure.jobstore import visible_generation_query
+from infrastructure.jobstore import connect as connect_jobs, visible_generation_query
 from infrastructure.storage import INDEX, PASSAGES_INDEX, client as es
 
 DB = Path(os.getenv("DATA_DIR", "/data")) / "jobs.sqlite3"
-INVOICE_SEARCH_FIELDS = [
-    "invoice_id", "filename", "invoice_number", "invoice_date", "customer_code",
+INVOICE_METADATA_FIELDS = [
+    "invoice_number", "invoice_date", "customer_code",
     "customer_tax_id", "delivery_note_ids", "concepts", "currency", "total_payable",
-    "invoice_total", "tax_base", "vat", "confidence", "evidence",
+    "invoice_total", "tax_base", "vat",
 ]
+INVOICE_SEARCH_FIELDS = ["invoice_id", "filename", *INVOICE_METADATA_FIELDS, "confidence", "evidence"]
 
 
 class ServiceUnavailable(Exception):
@@ -95,6 +97,46 @@ def run_invoice_filter(*, customer_code=None, customer_tax_id=None, invoice_numb
                 for hit in response["hits"]["hits"]
             ],
             "total": response["hits"]["total"]["value"], "limit": limit, "offset": offset}
+
+
+def run_invoice_metadata(invoice_id: str):
+    try:
+        with closing(connect_jobs(DB)) as db:
+            job = db.execute("SELECT id,filename,status FROM jobs WHERE id=?", (invoice_id,)).fetchone()
+    except Exception as error:
+        raise ServiceUnavailable(f"No se pudo consultar el documento: {type(error).__name__}") from error
+    if not job:
+        raise LookupError("Documento no encontrado")
+    if job["status"] != "indexed":
+        raise ValueError("Documento no indexado")
+
+    try:
+        response = es().search(index=INDEX, size=1, query={"bool": {"filter": [
+            {"term": {"invoice_id": invoice_id}}, visible_generation_query(path=DB),
+        ]}}, source=INVOICE_SEARCH_FIELDS)
+    except Exception as error:
+        raise ServiceUnavailable(f"No se pudieron consultar los metadatos: {type(error).__name__}") from error
+
+    hits = response["hits"]["hits"]
+    source = hits[0]["_source"] if hits else {}
+    metadata = {field: source.get(field, [] if field in {"delivery_note_ids", "concepts"} else None)
+                for field in INVOICE_METADATA_FIELDS}
+    confidence = source.get("confidence") or {}
+    evidence = source.get("evidence") or {}
+    return {
+        "invoice_id": invoice_id,
+        "filename": source.get("filename") or job["filename"],
+        "status": job["status"],
+        "file_url": f"/api/documents/{invoice_id}/file",
+        "index_record_available": bool(hits),
+        "metadata_available": any(value is not None and value != "" and value != []
+                                   for value in metadata.values()),
+        "metadata": metadata,
+        "confidence": {key: value for key, value in confidence.items()
+                       if key in INVOICE_METADATA_FIELDS},
+        "evidence": {key: value for key, value in evidence.items()
+                     if key in INVOICE_METADATA_FIELDS},
+    }
 
 
 def run_invoice_evidence_search(query: str, limit: int = 5, invoice_id: str | None = None):

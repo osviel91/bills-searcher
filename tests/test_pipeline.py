@@ -22,10 +22,11 @@ class PipelineTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
+        self.db_path = root / "jobs.sqlite3"
         self.patches = [
             patch.object(app, "DATA", root),
-            patch.object(app, "DB", root / "jobs.sqlite3"),
-            patch.object(search_application, "DB", root / "jobs.sqlite3"),
+            patch.object(app, "DB", self.db_path),
+            patch.object(search_application, "DB", self.db_path),
             patch.object(jobstore, "DATABASE_URL", ""),
             patch.object(app, "API_TOKEN", "test-secret"),
             patch.object(app, "initialize_index"),
@@ -261,6 +262,113 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(response.json()["content"], "Synthetic extracted quote")
         self.assertEqual(self.client.get("/api/documents/invoice-1/text").status_code, 401)
 
+    def test_document_metadata_requires_auth(self):
+        response = self.client.get("/api/documents/invoice-1/metadata")
+        self.assertEqual(response.status_code, 401)
+        self.es.search.assert_not_called()
+
+    def test_document_metadata_returns_exact_visible_generic_metadata(self):
+        with closing(jobstore.connect(self.db_path)) as db:
+            db.execute("INSERT INTO jobs(id,sha256,filename,object_key,status,active_generation_id) "
+                       "VALUES(?,?,?,?,?,?)",
+                       ("invoice-1", "metadata-hash", "invoice.pdf", "documents/invoice.pdf",
+                        "indexed", "test-generation"))
+            db.commit()
+        self.es.search.return_value = {"hits": {"hits": [{"_source": {
+            "invoice_id": "invoice-1", "filename": "invoice.pdf",
+            "invoice_number": "SYN-1001", "invoice_date": "2026-09-03",
+            "customer_code": "C-12", "customer_tax_id": "TAX-SYNTHETIC",
+            "delivery_note_ids": ["DN-1"], "concepts": ["Synthetic service"],
+            "currency": "EUR", "total_payable": 12.1, "invoice_total": 12.1,
+            "tax_base": 10.0, "vat": 2.1,
+            "confidence": {"invoice_number": 0.95, "template": "private"},
+            "evidence": {"invoice_number": "Nº de factura: SYN-1001", "template": "private"},
+            "content": "private document text", "template": "T02",
+            "execution_mode": "shadow-specialized", "fields": {"private": True},
+        }}]}}
+
+        response = self.client.get("/api/documents/invoice-1/metadata", headers=self.auth)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data["invoice_id"], "invoice-1")
+        self.assertEqual(data["status"], "indexed")
+        self.assertEqual(data["file_url"], "/api/documents/invoice-1/file")
+        self.assertTrue(data["index_record_available"])
+        self.assertTrue(data["metadata_available"])
+        self.assertEqual(data["metadata"]["invoice_number"], "SYN-1001")
+        self.assertEqual(data["metadata"]["tax_base"], 10.0)
+        self.assertEqual(data["confidence"], {"invoice_number": 0.95})
+        self.assertEqual(data["evidence"], {"invoice_number": "Nº de factura: SYN-1001"})
+        self.assertNotIn("content", data)
+        self.assertNotIn("template", data)
+        self.assertNotIn("execution_mode", data)
+        self.assertNotIn("fields", data)
+
+        request = self.es.search.call_args.kwargs
+        self.assertEqual(request["size"], 1)
+        self.assertIn({"term": {"invoice_id": "invoice-1"}}, request["query"]["bool"]["filter"])
+        self.assertIn({"terms": {"generation": ["test-generation"]}},
+                      request["query"]["bool"]["filter"])
+        self.assertNotIn("content", request["source"])
+        self.assertNotIn("embedding", request["source"])
+        self.assertNotIn("template", request["source"])
+
+    def test_document_metadata_distinguishes_missing_and_not_indexed(self):
+        missing = self.client.get("/api/documents/missing/metadata", headers=self.auth)
+        self.assertEqual(missing.status_code, 404)
+        self.es.search.assert_not_called()
+
+        with closing(jobstore.connect(self.db_path)) as db:
+            db.execute("INSERT INTO jobs(id,sha256,filename,object_key,status) VALUES(?,?,?,?,?)",
+                       ("queued", "queued-hash", "queued.pdf", "documents/queued.pdf", "queued"))
+            db.commit()
+        not_indexed = self.client.get("/api/documents/queued/metadata", headers=self.auth)
+        self.assertEqual(not_indexed.status_code, 409)
+        self.es.search.assert_not_called()
+
+    def test_document_metadata_reports_elasticsearch_unavailable_without_details(self):
+        with closing(jobstore.connect(self.db_path)) as db:
+            db.execute("INSERT INTO jobs(id,sha256,filename,object_key,status,active_generation_id) "
+                       "VALUES(?,?,?,?,?,?)",
+                       ("invoice-1", "metadata-hash", "invoice.pdf", "documents/invoice.pdf",
+                        "indexed", "test-generation"))
+            db.commit()
+        self.es.search.side_effect = RuntimeError("sensitive backend details")
+
+        response = self.client.get("/api/documents/invoice-1/metadata", headers=self.auth)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("RuntimeError", response.json()["detail"])
+        self.assertNotIn("sensitive backend details", response.text)
+
+    def test_document_metadata_marks_missing_active_record_and_fields_unavailable(self):
+        with closing(jobstore.connect(self.db_path)) as db:
+            db.execute("INSERT INTO jobs(id,sha256,filename,object_key,status,active_generation_id) "
+                       "VALUES(?,?,?,?,?,?)",
+                       ("invoice-1", "metadata-hash", "invoice.pdf", "documents/invoice.pdf",
+                        "indexed", "test-generation"))
+            db.commit()
+
+        self.es.search.return_value = {"hits": {"hits": []}}
+        missing_record = self.client.get("/api/documents/invoice-1/metadata", headers=self.auth)
+        self.assertEqual(missing_record.status_code, 200, missing_record.text)
+        self.assertFalse(missing_record.json()["index_record_available"])
+        self.assertFalse(missing_record.json()["metadata_available"])
+        self.assertEqual(missing_record.json()["metadata"]["concepts"], [])
+        self.assertIsNone(missing_record.json()["metadata"]["invoice_number"])
+
+        self.es.search.return_value = {"hits": {"hits": [{"_source": {
+            "invoice_id": "invoice-1", "filename": "invoice.pdf",
+            "invoice_number": None, "delivery_note_ids": [], "concepts": [],
+        }}]}}
+        empty_metadata = self.client.get("/api/documents/invoice-1/metadata", headers=self.auth)
+        self.assertEqual(empty_metadata.status_code, 200, empty_metadata.text)
+        self.assertTrue(empty_metadata.json()["index_record_available"])
+        self.assertFalse(empty_metadata.json()["metadata_available"])
+        self.assertEqual(empty_metadata.json()["confidence"], {})
+        self.assertEqual(empty_metadata.json()["evidence"], {})
+
     def test_reindex_invoices_requeues_existing_indexed_documents(self):
         with closing(app.connect()) as db:
             for doc_id, status in (("old-1", "indexed"), ("old-2", "indexed"), ("queued", "queued")):
@@ -350,6 +458,21 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("/api/invoices/filter", page)
         self.assertIn("/api/evaluation/evidence/cases", page)
         self.assertIn("/api/evaluation/evidence/run", page)
+
+    def test_home_exposes_responsive_document_metadata_action(self):
+        page = self.client.get("/").text
+        self.assertIn("Ver metadatos", page)
+        self.assertIn("/api/documents/${encodeURIComponent(doc.id)}/metadata", page)
+        self.assertIn("metadata-grid", page)
+        self.assertIn("@media(min-width:640px)", page)
+        self.assertIn("Extracción heurística", page)
+        self.assertIn("const el=(tag,text)=>{const n=document.createElement(tag);n.textContent=text;return n}", page)
+        self.assertIn("el('dd',metadataText(value))", page)
+        self.assertIn("el('p',metadataText(evidence))", page)
+        self.assertNotIn("innerHTML", page)
+        self.assertEqual(page.count("const metadataFields="), 1)
+        self.assertEqual(page.count("const metadataText="), 1)
+        self.assertIn("if(list.querySelector('.metadata-card:not(.hidden)'))return;", page)
 
     def test_swagger_docs_and_openapi_security_are_configured(self):
         docs = self.client.get("/api/docs")
