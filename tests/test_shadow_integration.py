@@ -205,6 +205,51 @@ class ShadowIntegrationTests(unittest.TestCase):
         self.assertEqual(blobs_after, expected_blobs)
         return job["active_generation_id"]
 
+    def _assert_specialized_evidence(self, doc_id, template):
+        expected_line_extractor = f"as400-{template.lower()}-lines"
+        with closing(connect()) as db:
+            run = db.execute("SELECT id,template,status FROM extraction_runs WHERE document_id=? "
+                             "AND execution_mode='shadow-specialized'", (doc_id,)).fetchone()
+            lines = list(db.execute("SELECT line_number,description FROM extraction_lines WHERE run_id=?",
+                                    (run["id"],)))
+            line_evidence = list(db.execute("SELECT line_number,page_number,quote,bounds_json,method,"
+                                            "extractor_id,extractor_version,source_token_ids_json "
+                                            "FROM extraction_evidence WHERE run_id=? AND line_number IS NOT NULL",
+                                            (run["id"],)))
+        self.assertEqual((run["template"], run["status"]), (template, "succeeded"))
+        self.assertTrue(lines)
+        self.assertTrue(line_evidence)
+        self.assertTrue(all(item["line_number"] in {line["line_number"] for line in lines}
+                            and item["page_number"] == 1
+                            and item["quote"] and json.loads(item["bounds_json"])
+                            and item["method"]
+                            and item["extractor_id"] == expected_line_extractor
+                            and item["extractor_version"] == "1"
+                            and json.loads(item["source_token_ids_json"])
+                            for item in line_evidence))
+        for line in lines:
+            description_words = set((line["description"] or "").upper().split())
+            evidence_quotes = [item["quote"].upper() for item in line_evidence
+                               if item["line_number"] == line["line_number"]]
+            self.assertTrue(description_words)
+            self.assertTrue(all(any(word in quote for quote in evidence_quotes)
+                                for word in description_words))
+
+        if template == "T02":
+            with closing(connect()) as db:
+                field = db.execute("SELECT observation_status FROM extraction_fields WHERE run_id=? "
+                                   "AND name='tax_rates'", (run["id"],)).fetchone()
+                evidence = db.execute("SELECT quote,bounds_json,method,"
+                                      "extractor_id,extractor_version,source_token_ids_json "
+                                      "FROM extraction_evidence WHERE run_id=? AND field_name='tax_rates'",
+                                      (run["id"],)).fetchone()
+            self.assertEqual(field["observation_status"], "confirmed")
+            self.assertTrue(evidence["quote"] and json.loads(evidence["bounds_json"]))
+            self.assertEqual((evidence["method"], evidence["extractor_id"],
+                              evidence["extractor_version"]),
+                             ("detail-vat-column", "as400-t02-header-summary", "1"))
+            self.assertTrue(json.loads(evidence["source_token_ids_json"]))
+
     def test_templates_unknown_and_disabled_vs_enabled_timings(self):
         timings = []
         expectations = {"T01": ("as400-t01-header-summary@1", "as400-t01-lines@1"),
@@ -259,6 +304,8 @@ class ShadowIntegrationTests(unittest.TestCase):
                 self.assertTrue(diagnostic["idempotency_key"].startswith("specialized-v1:"))
                 self.assertEqual(diagnostic["persistence_attempt_id"], diagnostic["attempt_id"])
                 self._assert_generic_and_published(doc_id, specialized=True, template=template)
+                if template in {"T01", "T02"}:
+                    self._assert_specialized_evidence(doc_id, template)
                 encoded = json.dumps(diagnostic)
                 for private_marker in ("synthetic-private-financial-text", "12,00", "10,00",
                                        "SERVICIO SINTETICO", "ARTICULO SINTETICO", "COMISION",
