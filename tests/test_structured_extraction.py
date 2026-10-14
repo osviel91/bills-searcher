@@ -10,10 +10,13 @@ import jobstore
 from application.structured_extraction import extract_document
 from application.extractor_registry import Extractor, select_extractor
 from domain.structured_extraction import (
+    BoundingBox,
     Evidence,
     ExtractedField,
     ExtractionExecution,
+    PDFPage,
     ProposedLine,
+    TextBlock,
 )
 from domain.invoice_extraction import extract_invoice
 from infrastructure.extraction_store import save_execution
@@ -48,6 +51,12 @@ def synthetic_pdf(pages):
         output.extend(f"{offset:010} 00000 n \n".encode("ascii"))
     output.extend(f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode("ascii"))
     return bytes(output)
+
+
+def extract_invoice_number(text):
+    block = TextBlock("synthetic", text, BoundingBox(0, 0, 100, 10))
+    fields, _, warnings = extract_invoice((PDFPage(1, 100, 100, text, (block,)),))
+    return next(field for field in fields if field.name == "invoice_number"), warnings
 
 
 class StructuredExtractionTests(unittest.TestCase):
@@ -171,6 +180,57 @@ class StructuredExtractionTests(unittest.TestCase):
         self.assertTrue(lines)
         self.assertTrue(all(row["page_number"] == 1 and row["quote"] for row in evidence))
         self.assertTrue(all(row["bounds_json"] for row in evidence))
+
+    def test_invoice_number_requires_an_explicit_label(self):
+        for text in (
+            "Este servicio factura 2025 por mantenimiento anual.",
+            "Este servicio factura: 2025 por mantenimiento anual.",
+            "Referencia interna 2025 sin etiqueta de factura.",
+        ):
+            with self.subTest(text=text):
+                field, _ = extract_invoice_number(text)
+                self.assertIsNone(field.value)
+                self.assertFalse(field.evidence)
+
+    def test_invoice_number_accepts_explicit_label_variants(self):
+        cases = (
+            ("Nº de factura: F-12345", "F-12345"),
+            ("N.º   de   factura   F-12345", "F-12345"),
+            ("N° DE FACTURA # 2024-15", "2024-15"),
+            ("Numero de Factura: AB/24", "AB/24"),
+            ("Núm. de factura: A-42", "A-42"),
+            ("Factura Nº: F-24", "F-24"),
+            ("Factura No. F-24", "F-24"),
+            ("Factura: F-2026/14", "F-2026/14"),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                field, _ = extract_invoice_number(text)
+                self.assertEqual(field.value, expected)
+
+    def test_invoice_number_skips_weak_mentions_before_explicit_label(self):
+        field, _ = extract_invoice_number(
+            "Este servicio factura 2025. Nº de factura: F-12345"
+        )
+        self.assertEqual(field.value, "F-12345")
+        self.assertEqual(field.evidence[0].quote, "Nº de factura: F-12345")
+        self.assertEqual(field.evidence[0].block_id, "synthetic")
+        self.assertIsNotNone(field.evidence[0].bounds)
+
+    def test_repeated_equal_invoice_number_candidates_are_accepted(self):
+        field, _ = extract_invoice_number(
+            "Nº de factura: F-12345. Número de factura: F-12345"
+        )
+        self.assertEqual(field.value, "F-12345")
+        self.assertEqual(field.evidence[0].quote, "Nº de factura: F-12345")
+
+    def test_conflicting_invoice_number_candidates_abstain(self):
+        field, _ = extract_invoice_number(
+            "Nº de factura: F-12345. Número de factura: G-54321"
+        )
+        self.assertIsNone(field.value)
+        self.assertFalse(field.evidence)
+        self.assertIn("Conflicting explicit invoice number candidates; abstained", field.warnings)
 
     def test_extractor_selection_reports_equal_priority_conflict(self):
         page = extract_pdf(synthetic_pdf([["Factura: F-12345"]]))

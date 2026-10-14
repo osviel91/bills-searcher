@@ -36,22 +36,32 @@ def extract_invoice(pages: tuple[PDFPage, ...]):
         "customer_tax_id", "currency", "tax_base", "vat", "total",
     )}
     warnings = []
+    number_marker = r"(?:n\s*\.?\s*[º°o]\.?|n[uú]m(?:ero)?\.?)"
+    invoice_number_pattern = re.compile(
+        rf"(?<!\w)(?:{number_marker}\s*(?:de\s*)?factura|"
+        rf"factura\s*{number_marker}|^\s*factura\s*[:#])\s*[:#-]?\s*"
+        r"([A-Z0-9][A-Z0-9/-]*)(?![\w/-])",
+        re.IGNORECASE | re.MULTILINE,
+    )
 
     def put(name, value, page, quote, block):
         if value is not None:
             fields[name] = ExtractedField(name, value, (Evidence(page.number, quote, block.bounds, block.id),))
 
     patterns = {
-        "invoice_number": r"(?:n[uú]m(?:ero)?\.?\s*(?:de\s*)?factura|factura(?:\s*n[uú]m(?:ero)?\.?)?)\s*[:#-]?\s*([\w/-]+)",
         "issuer_id": r"(?:emisor|proveedor)\s*(?:id|c[oó]digo)?\s*[:#-]\s*([^\s,;]+)",
         "customer_id": r"(?:cliente|destinatario)\s*(?:id|c[oó]digo)?\s*[:#-]\s*([^\s,;]+)",
     }
+    invoice_number_candidates = []
     for page, block in lines:
         text = block.text
+        for match in invoice_number_pattern.finditer(text):
+            if re.search(r"\d", match.group(1)):
+                invoice_number_candidates.append((page, block, match))
         for name, pattern in patterns.items():
             if fields[name].value is None:
                 match = re.search(pattern, text, re.IGNORECASE)
-                if match and (name != "invoice_number" or re.search(r"\d", match.group(1))):
+                if match:
                     put(name, match.group(1), page, match.group(), block)
         if fields["issue_date"].value is None and re.search(r"fecha", text, re.IGNORECASE):
             value, quote = _dates(text)
@@ -76,6 +86,17 @@ def extract_invoice(pages: tuple[PDFPage, ...]):
                 put("issuer_tax_id", ids[0], page, text, block)
             elif fields["customer_tax_id"].value is None and re.search(r"(?:cliente|destinatario)", text, re.I):
                 put("customer_tax_id", ids[0], page, text, block)
+
+    if invoice_number_candidates:
+        candidate_values = {match.group(1).casefold() for _, _, match in invoice_number_candidates}
+        if len(candidate_values) == 1:
+            page, block, match = invoice_number_candidates[0]
+            put("invoice_number", match.group(1), page, match.group(), block)
+        else:
+            fields["invoice_number"] = ExtractedField(
+                "invoice_number",
+                warnings=("Conflicting explicit invoice number candidates; abstained",),
+            )
 
     found = next(((index, page, block) for index, (page, block) in enumerate(lines)
                   if re.search(r"descripci[oó]n|concepto", block.text, re.I)), None)
