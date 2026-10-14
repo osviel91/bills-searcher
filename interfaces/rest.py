@@ -45,6 +45,7 @@ DB = DATA / "jobs.sqlite3"
 EVIDENCE_EVALUATION_LOCK = threading.Lock()
 INDEX_INITIALIZATION_ERROR = None
 MAX_BYTES = int(os.getenv("MAX_UPLOAD_MB", "25")) * 1024 * 1024
+MAX_TEXT_RESPONSE_BYTES = 256 * 1024
 MAX_BATCH_FILES = int(os.getenv("MAX_BATCH_FILES", "100"))
 API_TOKEN = os.getenv("API_TOKEN", "")
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -289,6 +290,16 @@ class DocumentMetadataResponse(BaseModel):
     evidence: dict = Field(default_factory=dict)
 
 
+class DocumentTextResponse(BaseModel):
+    invoice_id: str
+    filename: str
+    content: str
+    file_url: str
+    truncated: bool
+    total_bytes: int
+    returned_bytes: int
+
+
 class SearchResponse(BaseModel):
     results: list[SearchResult]
 
@@ -528,25 +539,57 @@ def document_metadata(doc_id: str):
 
 
 @app.get("/api/documents/{doc_id}/text", dependencies=[Depends(require_token)], tags=["Facturas"],
-         summary="Leer el texto extraído para revisar evidencia")
+         summary="Leer el texto extraído para revisar evidencia",
+         response_model=DocumentTextResponse,
+         responses={401: {"model": ApiError, "description": "Bearer token ausente o no válido."},
+                    404: {"model": ApiError, "description": "No existe texto visible para el documento."},
+                    409: {"model": ApiError, "description": "El documento todavía no está indexado."},
+                    503: {"model": ApiError, "description": "El jobstore o Elasticsearch no está disponible."}})
 def document_text(doc_id: str):
     try:
         with closing(connect()) as db:
-            row = db.execute("SELECT active_generation_id,status FROM jobs WHERE id=?", (doc_id,)).fetchone()
-        if not row or (row["status"] != "indexed" and not row["active_generation_id"]):
-            raise HTTPException(404, "Texto extraído no encontrado")
+            row = db.execute("SELECT filename,status FROM jobs WHERE id=?", (doc_id,)).fetchone()
+    except Exception as error:
+        raise HTTPException(503, f"No se pudo consultar el documento: {type(error).__name__}") from error
+    if not row:
+        raise HTTPException(404, "Texto extraído no encontrado")
+    if row["status"] != "indexed":
+        raise HTTPException(409, "El documento todavía no está indexado")
+
+    try:
         response = es().search(index=INDEX, size=1, query={"bool": {"filter": [
             {"term": {"invoice_id": doc_id}}, visible_generation_query(path=DB),
         ]}},
                                source=["invoice_id", "filename", "content"])
-    except HTTPException:
-        raise
     except Exception as error:
         raise HTTPException(503, f"No se pudo leer el texto extraído: {type(error).__name__}") from error
     hits = response["hits"]["hits"]
     if not hits:
         raise HTTPException(404, "Texto extraído no encontrado")
-    return {**hits[0]["_source"], "file_url": f"/api/documents/{doc_id}/file"}
+    source = hits[0]["_source"]
+    content = source.get("content") or ""
+    if not isinstance(content, str):
+        raise HTTPException(503, "El texto indexado no tiene un formato válido")
+
+    try:
+        content_bytes = content.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise HTTPException(503, "El texto indexado no es UTF-8 válido") from error
+
+    total_bytes = len(content_bytes)
+    truncated = total_bytes > MAX_TEXT_RESPONSE_BYTES
+    if truncated:
+        # The API response is bounded; Elasticsearch still returns the selected source field in full.
+        content = content_bytes[:MAX_TEXT_RESPONSE_BYTES].decode("utf-8", errors="ignore")
+    return {
+        "invoice_id": source.get("invoice_id") or doc_id,
+        "filename": source.get("filename") or row["filename"] or "",
+        "content": content,
+        "file_url": f"/api/documents/{doc_id}/file",
+        "truncated": truncated,
+        "total_bytes": total_bytes,
+        "returned_bytes": len(content.encode("utf-8")),
+    }
 
 
 @app.post(
@@ -825,5 +868,9 @@ document.querySelector('#search').onsubmit=async e=>{e.preventDefault();const li
  const invoiceCandidateRow=item=>{const row=el('li','');row.append(originalLink(item),document.createTextNode(` · ${item.score.toFixed(4)}`));return row};
  const passageCandidateRow=item=>{const row=el('li','');row.append(el('p',item.content),originalLink(item),document.createTextNode(` · caracteres ${item.start_offset}–${item.end_offset} · score ${item.score.toFixed(4)}`));return row};
  runEvaluationButton.onclick=async()=>{evaluationStatus.textContent='Ejecutando búsquedas locales…';evaluationResults.replaceChildren();try{await saveEvaluationCases();const response=await api('/api/evaluation/evidence/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cases:evaluationCases})}),data=await response.json();if(!response.ok)throw Error(data.detail||'No se pudo ejecutar la evaluación');const s=data.summary;evaluationStatus.textContent=`${s.cases} casos · media Invoice@5/10 ${s.mean_invoice_recall_at_5.toFixed(3)}/${s.mean_invoice_recall_at_10.toFixed(3)} · Evidencia global@5/10 ${s.mean_global_evidence_recall_at_5.toFixed(3)}/${s.mean_global_evidence_recall_at_10.toFixed(3)} · Evidencia filtrada@5/10 ${s.mean_scoped_evidence_recall_at_5.toFixed(3)}/${s.mean_scoped_evidence_recall_at_10.toFixed(3)}`;for(const item of data.results){const panel=document.createElement('div');panel.className='panel';panel.append(el('h3',item.query),el('p',`Factura @5/10 ${item.invoice_recall_at_5.toFixed(3)}/${item.invoice_recall_at_10.toFixed(3)} · Evidencia global @5/10 ${item.global_evidence_recall_at_5.toFixed(3)}/${item.global_evidence_recall_at_10.toFixed(3)} · Evidencia filtrada @5/10 ${item.scoped_evidence_recall_at_5.toFixed(3)}/${item.scoped_evidence_recall_at_10.toFixed(3)} · ${item.latency_ms} ms`),el('small','La evidencia filtrada usa el invoice_id esperado: mide recuperación condicional, no resolución de factura.'));panel.append(detailsList('Facturas candidatas globales',item.invoice_top10,invoiceCandidateRow),detailsList('Pasajes globales',item.global_evidence_top10,passageCandidateRow));for(const group of item.scoped_evidence_top10)panel.append(detailsList(`Pasajes filtrados · factura ${group.invoice_id}`,group.evidence,passageCandidateRow));evaluationResults.append(panel)}}catch(error){evaluationStatus.textContent=error.message}};
- authUI(false);if(hasToken())document.querySelector('#save-token').click();setInterval(refresh,5000);
+function renderDocumentText(data,target){target.replaceChildren(el('p',`${data.filename} · ${data.invoice_id}`));const sourceNote=el('p','Texto utilizado para la indexación. Su formato puede diferir del PDF original.');sourceNote.className='text-source-note';target.append(sourceNote);if(data.truncated)target.append(el('p',`Texto truncado: se muestran ${data.returned_bytes} de ${data.total_bytes} bytes. La copia incluye solo el texto mostrado.`));if(!data.content)target.append(el('p','No hay texto extraído disponible para este documento.'));else{const pre=document.createElement('pre');pre.className='text-content';pre.textContent=data.content;target.append(pre);const copy=el('button','Copiar texto'),copyStatus=el('span','');copy.type='button';copyStatus.setAttribute('role','status');copy.onclick=async()=>{try{await navigator.clipboard.writeText(data.content);copyStatus.textContent='Texto copiado.'}catch{copyStatus.textContent='No se pudo copiar. Selecciona el texto y cópialo manualmente.'}};target.append(copy,copyStatus)}target.append(originalLink(data,'Abrir PDF original'))}
+function addTextAction(doc){const button=el('button','Ver texto');button.type='button';button.setAttribute('aria-expanded','false');const panel=el('div','');panel.className='metadata-card text-card hidden';panel.setAttribute('aria-live','polite');let loaded=false,loading=false;button.onclick=async()=>{const opening=panel.classList.contains('hidden');panel.classList.toggle('hidden',!opening);button.textContent=opening?'Ocultar texto':'Ver texto';button.setAttribute('aria-expanded',String(opening));if(!opening||loaded||loading)return;loading=true;panel.replaceChildren(el('p','Cargando texto…'));try{const response=await api(`/api/documents/${encodeURIComponent(doc.id)}/text`),data=await response.json();if(!response.ok)throw Error(data.detail||'No se pudo cargar el texto');renderDocumentText(data,panel);loaded=true}catch(error){panel.replaceChildren(el('p',error.message))}finally{loading=false}};return [button,panel]}
+const addMetadataActionB31=addMetadataAction;addMetadataAction=doc=>[...addMetadataActionB31(doc),...addTextAction(doc)];
+const textStyles=document.createElement('style');textStyles.textContent='.text-content{max-height:60vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:12px 0;padding:14px;border:1px solid var(--line);border-radius:8px;background:#0c1219;font:14px/1.5 ui-monospace,SFMono-Regular,monospace}.text-source-note{margin:0 0 10px;color:var(--muted);font-size:.9rem;overflow-wrap:anywhere}.text-card .actions{flex-wrap:wrap}';document.head.append(textStyles);
+  authUI(false);if(hasToken())document.querySelector('#save-token').click();setInterval(refresh,5000);
 </script></html>'''

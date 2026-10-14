@@ -59,6 +59,17 @@ class PipelineTests(unittest.TestCase):
             item.stop()
         self.temp.cleanup()
 
+    def add_text_job(self, doc_id, *, status="indexed", generation="test-generation"):
+        with closing(jobstore.connect(self.db_path)) as db:
+            db.execute("INSERT INTO jobs(id,sha256,filename,object_key,status,active_generation_id) "
+                       "VALUES(?,?,?,?,?,?)",
+                       (doc_id, doc_id, "invoice.pdf", f"documents/{doc_id}.pdf", status, generation))
+            db.commit()
+
+    def request_text(self, doc_id, headers=None):
+        with patch.object(app, "connect", side_effect=lambda: jobstore.connect(self.db_path)):
+            return self.client.get(f"/api/documents/{doc_id}/text", headers=headers)
+
     def test_multi_upload_normalizes_wrappers_and_deduplicates(self):
         first = b"--boundary\r\nContent-Type: multipart/form-data\r\n\r\n%PDF-1.4\nfixture-one"
         second = b"%PDF-1.4\nfixture-two"
@@ -250,17 +261,95 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(search.call_args_list[1].kwargs, {"limit": 10, "invoice_id": "invoice-1"})
 
     def test_extracted_text_endpoint_requires_auth_and_returns_source_text(self):
-        with closing(app.connect()) as db:
-            db.execute("INSERT INTO jobs(id,sha256,filename,object_key,status,active_generation_id) VALUES(?,?,?,?,?,?)",
-                       ("invoice-1", "text-hash", "invoice.pdf", "documents/invoice.pdf", "indexed", "test-generation"))
-            db.commit()
+        self.add_text_job("invoice-1")
         self.es.search.return_value = {"hits": {"hits": [{"_source": {
             "invoice_id": "invoice-1", "filename": "invoice.pdf", "content": "Synthetic extracted quote",
         }}]}}
-        response = self.client.get("/api/documents/invoice-1/text", headers=self.auth)
+        with patch.object(app, "visible_generation_query",
+                          return_value={"terms": {"generation": ["test-generation"]}}):
+            response = self.request_text("invoice-1", self.auth)
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["content"], "Synthetic extracted quote")
-        self.assertEqual(self.client.get("/api/documents/invoice-1/text").status_code, 401)
+        self.assertEqual(response.json(), {
+            "invoice_id": "invoice-1", "filename": "invoice.pdf",
+            "content": "Synthetic extracted quote", "file_url": "/api/documents/invoice-1/file",
+            "truncated": False, "total_bytes": 25, "returned_bytes": 25,
+        })
+        request = self.es.search.call_args.kwargs
+        self.assertEqual(request["size"], 1)
+        self.assertEqual(request["source"], ["invoice_id", "filename", "content"])
+        self.assertIn({"term": {"invoice_id": "invoice-1"}}, request["query"]["bool"]["filter"])
+        self.assertIn({"terms": {"generation": ["test-generation"]}},
+                      request["query"]["bool"]["filter"])
+        self.es.search.reset_mock()
+        self.assertEqual(self.request_text("invoice-1").status_code, 401)
+        self.es.search.assert_not_called()
+
+    def test_text_endpoint_rejects_nonindexed_job_even_with_an_active_generation(self):
+        self.add_text_job("queued-text", status="queued", generation="previous-generation")
+
+        response = self.request_text("queued-text", self.auth)
+
+        self.assertEqual(response.status_code, 409)
+        self.es.search.assert_not_called()
+
+    def test_text_endpoint_distinguishes_missing_job_and_missing_visible_record(self):
+        self.assertEqual(self.request_text("unknown-text", self.auth).status_code, 404)
+        self.es.search.assert_not_called()
+
+        self.add_text_job("missing-record")
+        self.es.search.return_value = {"hits": {"hits": []}}
+        with patch.object(app, "visible_generation_query", return_value={"match_all": {}}):
+            self.assertEqual(self.request_text("missing-record", self.auth).status_code, 404)
+
+    def test_text_endpoint_returns_empty_text_with_zero_byte_counts(self):
+        self.add_text_job("empty-text")
+        self.es.search.return_value = {"hits": {"hits": [{"_source": {
+            "invoice_id": "empty-text", "filename": "invoice.pdf", "content": "",
+        }}]}}
+        with patch.object(app, "visible_generation_query", return_value={"match_all": {}}):
+            response = self.request_text("empty-text", self.auth)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"], "")
+        self.assertEqual(response.json()["total_bytes"], 0)
+        self.assertEqual(response.json()["returned_bytes"], 0)
+        self.assertFalse(response.json()["truncated"])
+
+    def test_text_endpoint_maps_jobstore_and_elasticsearch_failures_to_503(self):
+        with patch.object(app, "connect", side_effect=RuntimeError("private database detail")):
+            database_error = self.client.get("/api/documents/invoice-1/text", headers=self.auth)
+        self.assertEqual(database_error.status_code, 503)
+        self.assertNotIn("private database detail", database_error.text)
+
+        self.add_text_job("es-failure")
+        self.es.search.side_effect = RuntimeError("private Elasticsearch detail")
+        with patch.object(app, "visible_generation_query", return_value={"match_all": {}}):
+            elasticsearch_error = self.request_text("es-failure", self.auth)
+        self.assertEqual(elasticsearch_error.status_code, 503)
+        self.assertNotIn("private Elasticsearch detail", elasticsearch_error.text)
+
+    def test_text_endpoint_enforces_utf8_byte_limit_and_reports_sizes(self):
+        limit = app.MAX_TEXT_RESPONSE_BYTES
+        cases = (
+            ("exact-limit", "a" * limit, limit, False),
+            ("over-limit", "b" * (limit + 17), limit, True),
+            ("utf8-boundary", "c" * (limit - 1) + "é", limit - 1, True),
+        )
+        for doc_id, content, returned_bytes, truncated in cases:
+            with self.subTest(doc_id=doc_id):
+                self.add_text_job(doc_id)
+                self.es.search.return_value = {"hits": {"hits": [{"_source": {
+                    "invoice_id": doc_id, "filename": "invoice.pdf", "content": content,
+                }}]}}
+                with patch.object(app, "visible_generation_query", return_value={"match_all": {}}):
+                    response = self.request_text(doc_id, self.auth)
+                data = response.json()
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(data["total_bytes"], len(content.encode("utf-8")))
+                self.assertEqual(data["returned_bytes"], returned_bytes)
+                self.assertEqual(data["truncated"], truncated)
+                self.assertLessEqual(data["returned_bytes"], limit)
+                self.assertEqual(data["returned_bytes"], len(data["content"].encode("utf-8")))
 
     def test_document_metadata_requires_auth(self):
         response = self.client.get("/api/documents/invoice-1/metadata")
@@ -473,6 +562,24 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(page.count("const metadataFields="), 1)
         self.assertEqual(page.count("const metadataText="), 1)
         self.assertIn("if(list.querySelector('.metadata-card:not(.hidden)'))return;", page)
+
+    def test_home_exposes_safe_text_view_copy_and_responsive_states(self):
+        page = self.client.get("/").text
+        self.assertIn("Ver texto", page)
+        self.assertIn("/api/documents/${encodeURIComponent(doc.id)}/text", page)
+        self.assertIn("if(x.status==='indexed')li.append(...addMetadataAction(x))", page)
+        self.assertIn("pre.textContent=data.content", page)
+        self.assertIn("navigator.clipboard.writeText(data.content)", page)
+        self.assertIn("Texto copiado.", page)
+        self.assertIn("No se pudo copiar.", page)
+        self.assertIn("Texto utilizado para la indexación. Su formato puede diferir del PDF original.", page)
+        self.assertLess(page.index("const sourceNote=el('p','Texto utilizado para la indexación."),
+                        page.index("if(data.truncated)"))
+        self.assertIn("data.truncated", page)
+        self.assertIn("No hay texto extraído disponible", page)
+        self.assertIn("max-height:60vh;overflow:auto;white-space:pre-wrap", page)
+        self.assertIn("const opening=panel.classList.contains('hidden')", page)
+        self.assertNotIn("innerHTML", page)
 
     def test_swagger_docs_and_openapi_security_are_configured(self):
         docs = self.client.get("/api/docs")
