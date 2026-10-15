@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "case_id": "synthetic_basic_001",
+      "pdf": "fixtures/synthetic-basic-001.pdf",
+      "gold": {
+        "text": "Factura: F-1001\nFecha: 03/09/2026\nMoneda EUR\nDescripcion | Cantidad | Precio | Importe\nConsulting | 1 | 10,00 | 10,00\nBase imponible: 10,00\nIVA 21%: 2,10\nTotal: 12,10",
+        "critical_fields": {
+          "invoice_number": "F-1001",
+          "issue_date": "03/09/2026"
+        },
+        "section_order": ["Factura", "Fecha", "Descripcion", "Base imponible", "IVA", "Total"]
+      }
+    }
+  ]
+}

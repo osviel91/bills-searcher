@@ -8,3 +8,4 @@ __pycache__/
 garage.toml
 evidence-evaluation.json
 .evidence-evaluation-*.tmp
+.local-extraction-benchmark/
